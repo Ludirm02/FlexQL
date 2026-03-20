@@ -120,6 +120,6 @@ int main(int argc, char** argv) {
     }
 
     flexql_close(db);
-    std::cout << "Disconnected.\n";
+    std::cout << "Connection closed\n";
     return 0;
 }
