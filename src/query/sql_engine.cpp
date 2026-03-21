@@ -67,7 +67,7 @@ std::size_t estimate_query_result_bytes(const QueryResult& result) {
 
 SqlEngine::QueryCache::QueryCache(std::size_t capacity)
     : capacity_(capacity == 0 ? 1 : capacity),
-      max_bytes_(std::max<std::size_t>(8ULL * 1024 * 1024, capacity_ * 128ULL * 1024ULL)) {}
+      max_bytes_(512ULL * 1024 * 1024) {}
 
 bool SqlEngine::QueryCache::get(const std::string& key,
                                 const std::unordered_map<std::string, std::uint64_t>& current_versions,
@@ -95,8 +95,7 @@ void SqlEngine::QueryCache::put(const std::string& key,
                                 const QueryResult& result,
                                 const std::unordered_map<std::string, std::uint64_t>& versions) {
     const std::size_t approx_bytes = estimate_query_result_bytes(result);
-    // Keep cache for hot small/medium queries; skip very large result sets to avoid memory blowups.
-    if (approx_bytes > max_bytes_ / 2) {
+    if (approx_bytes > 256ULL * 1024 * 1024) {
         return;
     }
 
@@ -1104,7 +1103,10 @@ bool SqlEngine::parse_insert(const std::string& sql,
                              std::vector<std::int64_t>& expires_at,
                              std::string& error) const {
     std::string s = trim(sql);
-    std::string upper = to_upper(s);
+    // Only uppercase first 128 chars — INSERT INTO tablename VALUES always fits here
+    // This avoids copying the entire 40KB batch INSERT string for case conversion
+    const std::size_t header_scan = std::min<std::size_t>(s.size(), 128);
+    std::string upper = to_upper(s.substr(0, header_scan));
     if (!starts_with_keyword(upper, kInsertIntoKw)) {
         error = "expected INSERT INTO";
         return false;
@@ -1112,12 +1114,15 @@ bool SqlEngine::parse_insert(const std::string& sql,
 
     std::size_t values_kw = find_keyword(upper, "VALUES", 0);
     if (values_kw == std::string::npos) {
+        upper = to_upper(s);
+        values_kw = find_keyword(upper, "VALUES", 0);
+    }
+    if (values_kw == std::string::npos) {
         error = "INSERT must contain VALUES clause";
         return false;
     }
 
-    std::string table_part = trim(s.substr(std::strlen(kInsertIntoKw), values_kw - std::strlen(kInsertIntoKw)));
-    if (!is_identifier(table_part)) {
+    std::string table_part = trim(s.substr(std::strlen(kInsertIntoKw), values_kw - std::strlen(kInsertIntoKw)));    if (!is_identifier(table_part)) {
         error = "invalid table name in INSERT";
         return false;
     }

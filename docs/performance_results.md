@@ -13,18 +13,19 @@
 ### 100K rows
 
 ```text
-rows_inserted=100000
-insert_total_seconds=0.192248
-insert_rows_per_second=520162
+rows_inserted=10000000
+insert_total_seconds=19.5357
+insert_rows_per_second=511884
 point_queries=5000
-point_query_total_seconds=0.120929
-point_query_avg_ms=0.0241857
-full_scan_rows_returned=50000
-full_scan_seconds=0.0280519
-cached_query_rows_first=20000
-cached_query_rows_second=20000
-cached_query_first_seconds=0.00464554
-cached_query_second_seconds=0.00155936
+point_query_total_seconds=0.147789
+point_query_avg_ms=0.0295577
+full_scan_rows_returned=5000000
+full_scan_seconds=1.43346
+cached_query_rows_first=2000000
+cached_query_rows_second=2000000
+cached_query_first_seconds=0.649223
+cached_query_second_seconds=0.534223
+
 ```
 
 ### 1M rows
