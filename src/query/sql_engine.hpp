@@ -126,12 +126,15 @@ private:
 
     bool evaluate_where(const Table& table,
                         const Row& row,
+                        std::size_t row_idx,
                         const Condition& condition,
                         std::string* error) const;
     bool evaluate_where_join(const Table& left,
                              const Row& left_row,
+                             std::size_t left_row_idx,
                              const Table& right,
                              const Row& right_row,
+                             std::size_t right_row_idx,
                              const Condition& condition,
                              std::string* error) const;
 
@@ -167,9 +170,8 @@ private:
                                     const std::string& kw,
                                     std::size_t start = 0);
     static bool row_alive(const Row& row, std::int64_t now_ts);
-    static bool row_index_of(const Table& table, const Row& row, std::size_t& row_idx);
     static bool row_numeric_value(const Table& table,
-                                  const Row& row,
+                                  std::size_t row_idx,
                                   std::size_t col_idx,
                                   double& out);
 

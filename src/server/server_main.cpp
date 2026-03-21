@@ -70,7 +70,7 @@ bool send_error(int fd, const std::string& message) {
 }
 
 bool send_result(int fd, const QueryResult& result) {
-    constexpr std::size_t kChunkFlush = 64 * 1024;
+    constexpr std::size_t kChunkFlush = 256 * 1024;
     std::string chunk;
     chunk.reserve(kChunkFlush + 4096);
 
@@ -122,16 +122,20 @@ void handle_client(int client_fd, SqlEngine* engine) {
         }
 
         std::size_t len = 0;
-        try {
-            std::size_t consumed = 0;
-            len = static_cast<std::size_t>(std::stoull(header.substr(2), &consumed));
-            if (consumed != header.substr(2).size()) {
+        {
+            const char* num_start = header.c_str() + 2;
+            char* num_end = nullptr;
+            errno = 0;
+            unsigned long long parsed = std::strtoull(num_start, &num_end, 10);
+            if (errno != 0 || num_end == num_start || *num_end != '\0') {
                 if (!send_error(client_fd, "protocol error: invalid query length")) {
                     break;
                 }
                 continue;
             }
-        } catch (const std::exception&) {
+            len = static_cast<std::size_t>(parsed);
+        }
+        if (len > (1ULL << 31)) {
             if (!send_error(client_fd, "protocol error: invalid query length")) {
                 break;
             }

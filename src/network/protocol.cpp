@@ -18,7 +18,7 @@ struct ReaderState {
     std::size_t start = 0;
     std::size_t end = 0;
 
-    ReaderState() : buffer(8192) {}
+    ReaderState() : buffer(65536) {}
 };
 
 thread_local std::unordered_map<int, ReaderState> g_reader_states;

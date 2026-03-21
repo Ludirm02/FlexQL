@@ -361,15 +361,9 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
         return false;
     }
 
-    const std::string cache_key = normalize_sql_for_cache(sql);
     const std::int64_t now_ts = now_unix();
 
     std::shared_lock<std::shared_mutex> lock(db_mutex_);
-    auto versions = capture_versions(plan.touched_tables);
-    if (cache_.get(cache_key, versions, out)) {
-        return true;
-    }
-
     auto base_it = tables_.find(plan.base_table);
     if (base_it == tables_.end()) {
         error = "unknown table: " + plan.base_table;
@@ -377,6 +371,23 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
     }
 
     const Table& base = base_it->second;
+    bool skip_cache = false;
+    if (!plan.has_join && plan.where.present && plan.where.op == "=" && base.primary_key_col >= 0) {
+        const std::string& pk_name = base.columns[static_cast<std::size_t>(base.primary_key_col)].name;
+        if (plan.where.column == pk_name || plan.where.column == (base.name + "." + pk_name)) {
+            skip_cache = true;
+        }
+    }
+
+    std::string cache_key;
+    std::unordered_map<std::string, std::uint64_t> versions;
+    if (!skip_cache) {
+        cache_key = normalize_sql_for_cache(sql);
+        versions = capture_versions(plan.touched_tables);
+        if (cache_.get(cache_key, versions, out)) {
+            return true;
+        }
+    }
 
     if (!plan.has_join) {
         std::vector<std::size_t> selected_indexes;
@@ -619,7 +630,9 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             }
         }
 
-        cache_.put(cache_key, out, versions);
+        if (!skip_cache) {
+            cache_.put(cache_key, out, versions);
+        }
         return true;
     }
 
@@ -888,7 +901,14 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             const Row* right_row_ptr = &right.rows[right_row_idx];
 
             std::string where_error;
-            bool pass = evaluate_where_join(base, *base_row_ptr, right, *right_row_ptr, plan.where, &where_error);
+            bool pass = evaluate_where_join(base,
+                                            *base_row_ptr,
+                                            base_row_idx,
+                                            right,
+                                            *right_row_ptr,
+                                            right_row_idx,
+                                            plan.where,
+                                            &where_error);
             if (!where_error.empty()) {
                 error = where_error;
                 return false;
@@ -910,7 +930,9 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
         }
     }
 
-    cache_.put(cache_key, out, versions);
+    if (!skip_cache) {
+        cache_.put(cache_key, out, versions);
+    }
     return true;
 }
 
@@ -1429,6 +1451,7 @@ bool SqlEngine::parse_select(const std::string& sql, SelectPlan& plan, std::stri
 
 bool SqlEngine::evaluate_where(const Table& table,
                                const Row& row,
+                               std::size_t row_idx,
                                const Condition& condition,
                                std::string* error) const {
     if (!condition.present) {
@@ -1462,7 +1485,7 @@ bool SqlEngine::evaluate_where(const Table& table,
     double rhs_num = 0.0;
     double lhs_num = 0.0;
     if ((col->type == DataType::kInt || col->type == DataType::kDecimal || col->type == DataType::kDatetime) &&
-        row_numeric_value(table, row, idx, lhs_num) &&
+        row_numeric_value(table, row_idx, idx, lhs_num) &&
         parse_numeric_literal(rhs, col->type, rhs_num)) {
         if (!eval_numeric_op(lhs_num, rhs_num, condition.op, result)) {
             if (error != nullptr) {
@@ -1485,8 +1508,10 @@ bool SqlEngine::evaluate_where(const Table& table,
 
 bool SqlEngine::evaluate_where_join(const Table& left,
                                     const Row& left_row,
+                                    std::size_t left_row_idx,
                                     const Table& right,
                                     const Row& right_row,
+                                    std::size_t right_row_idx,
                                     const Condition& condition,
                                     std::string* error) const {
     if (!condition.present) {
@@ -1500,6 +1525,7 @@ bool SqlEngine::evaluate_where_join(const Table& left,
 
     const Table* table = nullptr;
     const Row* row = nullptr;
+    std::size_t row_idx = 0;
 
     if (cond_table.empty()) {
         std::size_t dummy = 0;
@@ -1522,16 +1548,20 @@ bool SqlEngine::evaluate_where_join(const Table& left,
         if (in_left) {
             table = &left;
             row = &left_row;
+            row_idx = left_row_idx;
         } else {
             table = &right;
             row = &right_row;
+            row_idx = right_row_idx;
         }
     } else if (cond_table == left.name) {
         table = &left;
         row = &left_row;
+        row_idx = left_row_idx;
     } else if (cond_table == right.name) {
         table = &right;
         row = &right_row;
+        row_idx = right_row_idx;
     } else {
         if (error != nullptr) {
             *error = "WHERE references unknown table: " + cond_table;
@@ -1554,7 +1584,7 @@ bool SqlEngine::evaluate_where_join(const Table& left,
     double rhs_num = 0.0;
     double lhs_num = 0.0;
     if ((col->type == DataType::kInt || col->type == DataType::kDecimal || col->type == DataType::kDatetime) &&
-        row_numeric_value(*table, *row, idx, lhs_num) &&
+        row_numeric_value(*table, row_idx, idx, lhs_num) &&
         parse_numeric_literal(rhs, col->type, rhs_num)) {
         if (!eval_numeric_op(lhs_num, rhs_num, condition.op, result)) {
             if (error != nullptr) {
@@ -2123,30 +2153,11 @@ bool SqlEngine::row_alive(const Row& row, std::int64_t now_ts) {
     return row.expires_at_unix == 0 || row.expires_at_unix > now_ts;
 }
 
-bool SqlEngine::row_index_of(const Table& table, const Row& row, std::size_t& row_idx) {
-    if (table.rows.empty()) {
-        return false;
-    }
-    const Row* begin = table.rows.data();
-    const Row* end = begin + table.rows.size();
-    const Row* ptr = &row;
-    if (ptr < begin || ptr >= end) {
-        return false;
-    }
-    row_idx = static_cast<std::size_t>(ptr - begin);
-    return true;
-}
-
 bool SqlEngine::row_numeric_value(const Table& table,
-                                  const Row& row,
+                                  std::size_t row_idx,
                                   std::size_t col_idx,
                                   double& out) {
     if (col_idx >= table.numeric_column_valid.size() || col_idx >= table.numeric_column_values.size()) {
-        return false;
-    }
-
-    std::size_t row_idx = 0;
-    if (!row_index_of(table, row, row_idx)) {
         return false;
     }
     const auto& valid = table.numeric_column_valid[col_idx];
