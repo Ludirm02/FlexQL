@@ -23,6 +23,30 @@ constexpr const char* kCreateTableKw = "CREATE TABLE";
 constexpr const char* kInsertIntoKw = "INSERT INTO";
 constexpr const char* kSelectKw = "SELECT";
 
+inline bool is_space_char(char c) {
+    return std::isspace(static_cast<unsigned char>(c)) != 0;
+}
+
+void trim_in_place(std::string& s) {
+    std::size_t b = 0;
+    while (b < s.size() && is_space_char(s[b])) {
+        ++b;
+    }
+    std::size_t e = s.size();
+    while (e > b && is_space_char(s[e - 1])) {
+        --e;
+    }
+    if (b == 0 && e == s.size()) {
+        return;
+    }
+    if (b >= e) {
+        s.clear();
+        return;
+    }
+    s.erase(e);
+    s.erase(0, b);
+}
+
 std::size_t estimate_query_result_bytes(const QueryResult& result) {
     std::size_t bytes = sizeof(QueryResult);
     bytes += result.columns.size() * sizeof(std::string);
@@ -156,7 +180,6 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
     t.rows.reserve(1024);
     t.column_index.reserve(t.columns.size());
     t.numeric_range_index.resize(t.columns.size());
-    t.numeric_range_sorted.resize(t.columns.size(), 1);
     t.numeric_column_values.resize(t.columns.size());
     t.numeric_column_valid.resize(t.columns.size());
     if (primary_col >= 0) {
@@ -167,6 +190,9 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
         t.column_index[t.columns[i].name] = i;
         if (t.columns[i].type == DataType::kInt || t.columns[i].type == DataType::kDecimal ||
             t.columns[i].type == DataType::kDatetime) {
+            if (t.primary_key_col >= 0 && i == static_cast<std::size_t>(t.primary_key_col)) {
+                continue;
+            }
             t.numeric_column_values[i].reserve(1024);
             t.numeric_column_valid[i].reserve(1024);
         }
@@ -201,6 +227,9 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             if (table.columns[i].type != DataType::kInt &&
                 table.columns[i].type != DataType::kDecimal &&
                 table.columns[i].type != DataType::kDatetime) {
+                continue;
+            }
+            if (table.primary_key_col >= 0 && i == static_cast<std::size_t>(table.primary_key_col)) {
                 continue;
             }
             if (table.numeric_range_index[i].capacity() < target) {
@@ -307,6 +336,9 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
                 table.columns[i].type != DataType::kDatetime) {
                 continue;
             }
+            if (table.primary_key_col >= 0 && i == static_cast<std::size_t>(table.primary_key_col)) {
+                continue;
+            }
 
             table.numeric_column_values[i].push_back(parsed_numeric[i]);
             table.numeric_column_valid[i].push_back(parsed_numeric_valid[i]);
@@ -316,7 +348,6 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             }
             table.numeric_range_index[i].push_back(
                 Table::NumericIndexEntry{parsed_numeric[i], row_idx});
-            table.numeric_range_sorted[i] = 0U;
         }
     }
 
@@ -520,83 +551,49 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
                 return false;
             }
 
-            Table& mutable_base = const_cast<Table&>(base);
-            {
-                std::lock_guard<std::mutex> guard(numeric_index_mutex_);
-                if (mutable_base.numeric_range_sorted[where_meta.idx] == 0U) {
-                    auto& idx_vec = mutable_base.numeric_range_index[where_meta.idx];
-                    std::sort(idx_vec.begin(), idx_vec.end(),
-                              [](const Table::NumericIndexEntry& a, const Table::NumericIndexEntry& b) {
-                                  if (a.value == b.value) {
-                                      return a.row_idx < b.row_idx;
-                                  }
-                                  return a.value < b.value;
-                              });
-                    mutable_base.numeric_range_sorted[where_meta.idx] = 1U;
-                }
-            }
-
-            const auto& idx_vec = mutable_base.numeric_range_index[where_meta.idx];
-            auto lower = std::lower_bound(
-                idx_vec.begin(), idx_vec.end(), where_meta.rhs_numeric,
-                [](const Table::NumericIndexEntry& a, double rhs) { return a.value < rhs; });
-            auto upper = std::upper_bound(
-                idx_vec.begin(), idx_vec.end(), where_meta.rhs_numeric,
-                [](double rhs, const Table::NumericIndexEntry& a) { return rhs < a.value; });
-
-            std::size_t candidate_count = 0;
-            if (where_meta.op == "=") {
-                candidate_count = static_cast<std::size_t>(std::distance(lower, upper));
-            } else if (where_meta.op == "<") {
-                candidate_count = static_cast<std::size_t>(std::distance(idx_vec.begin(), lower));
-            } else if (where_meta.op == "<=") {
-                candidate_count = static_cast<std::size_t>(std::distance(idx_vec.begin(), upper));
-            } else if (where_meta.op == ">") {
-                candidate_count = static_cast<std::size_t>(std::distance(upper, idx_vec.end()));
-            } else if (where_meta.op == ">=") {
-                candidate_count = static_cast<std::size_t>(std::distance(lower, idx_vec.end()));
-            }
-            if (candidate_count > out.rows.capacity()) {
-                out.rows.reserve(candidate_count);
-            }
-
-            auto visit_range = [&](auto begin_it, auto end_it) -> bool {
-                for (auto it = begin_it; it != end_it; ++it) {
-                    if (it->row_idx >= base.rows.size()) {
-                        continue;
-                    }
-                    const Row& row = base.rows[it->row_idx];
-                    if (!row_alive(row, now_ts)) {
-                        continue;
-                    }
-                    bool pass = false;
-                    if (!passes_where(it->row_idx, pass)) {
-                        return false;
-                    }
-                    if (!pass) {
-                        continue;
-                    }
-                    emit_projected_row(it->row_idx);
-                }
+            const auto& idx_vec = base.numeric_range_index[where_meta.idx];
+            if (idx_vec.empty()) {
                 return true;
+            }
+
+            const std::size_t reserve_target = idx_vec.size() / 2;
+            if (reserve_target > out.rows.capacity()) {
+                out.rows.reserve(reserve_target);
+            }
+
+            auto matches = [&](double lhs) -> bool {
+                if (where_meta.op == "=") {
+                    return lhs == where_meta.rhs_numeric;
+                }
+                if (where_meta.op == "<") {
+                    return lhs < where_meta.rhs_numeric;
+                }
+                if (where_meta.op == "<=") {
+                    return lhs <= where_meta.rhs_numeric;
+                }
+                if (where_meta.op == ">") {
+                    return lhs > where_meta.rhs_numeric;
+                }
+                if (where_meta.op == ">=") {
+                    return lhs >= where_meta.rhs_numeric;
+                }
+                return false;
             };
 
-            if (where_meta.op == "=") {
-                return visit_range(lower, upper);
+            for (const auto& entry : idx_vec) {
+                if (!matches(entry.value)) {
+                    continue;
+                }
+                if (entry.row_idx >= base.rows.size()) {
+                    continue;
+                }
+                const Row& row = base.rows[entry.row_idx];
+                if (!row_alive(row, now_ts)) {
+                    continue;
+                }
+                emit_projected_row(entry.row_idx);
             }
-            if (where_meta.op == "<") {
-                return visit_range(idx_vec.begin(), lower);
-            }
-            if (where_meta.op == "<=") {
-                return visit_range(idx_vec.begin(), upper);
-            }
-            if (where_meta.op == ">") {
-                return visit_range(upper, idx_vec.end());
-            }
-            if (where_meta.op == ">=") {
-                return visit_range(lower, idx_vec.end());
-            }
-            return false;
+            return true;
         };
 
         if (!maybe_pk_index_scan()) {
@@ -1782,6 +1779,15 @@ bool SqlEngine::fast_parse_int64(const std::string& s, std::int64_t& out) {
     }
     const char* begin = s.data();
     const char* end = s.data() + s.size();
+    while (begin < end && is_space_char(*begin)) {
+        ++begin;
+    }
+    while (end > begin && is_space_char(*(end - 1))) {
+        --end;
+    }
+    if (begin == end) {
+        return false;
+    }
     auto parsed = std::from_chars(begin, end, out, 10);
     return parsed.ec == std::errc{} && parsed.ptr == end;
 }
@@ -1793,15 +1799,26 @@ bool SqlEngine::fast_parse_double(const std::string& s, double& out) {
 
     const char* begin = s.data();
     const char* endp = s.data() + s.size();
+    while (begin < endp && is_space_char(*begin)) {
+        ++begin;
+    }
+    while (endp > begin && is_space_char(*(endp - 1))) {
+        --endp;
+    }
+    if (begin == endp) {
+        return false;
+    }
+
     auto parsed_fast = std::from_chars(begin, endp, out, std::chars_format::general);
     if (parsed_fast.ec == std::errc{} && parsed_fast.ptr == endp) {
         return true;
     }
 
+    std::string tmp(begin, endp);
     char* end = nullptr;
     errno = 0;
-    double parsed = std::strtod(s.c_str(), &end);
-    if (errno == ERANGE || end == s.c_str() || *end != '\0') {
+    double parsed = std::strtod(tmp.c_str(), &end);
+    if (errno == ERANGE || end == tmp.c_str() || *end != '\0') {
         return false;
     }
     out = parsed;
@@ -1809,36 +1826,42 @@ bool SqlEngine::fast_parse_double(const std::string& s, double& out) {
 }
 
 bool SqlEngine::is_null_literal_ci(const std::string& s) {
-    const std::string v = trim(s);
-    if (v.size() != 4) {
+    std::size_t b = 0;
+    std::size_t e = s.size();
+    while (b < e && is_space_char(s[b])) {
+        ++b;
+    }
+    while (e > b && is_space_char(s[e - 1])) {
+        --e;
+    }
+    if (e - b != 4) {
         return false;
     }
-    return std::toupper(static_cast<unsigned char>(v[0])) == 'N' &&
-           std::toupper(static_cast<unsigned char>(v[1])) == 'U' &&
-           std::toupper(static_cast<unsigned char>(v[2])) == 'L' &&
-           std::toupper(static_cast<unsigned char>(v[3])) == 'L';
+    return std::toupper(static_cast<unsigned char>(s[b])) == 'N' &&
+           std::toupper(static_cast<unsigned char>(s[b + 1])) == 'U' &&
+           std::toupper(static_cast<unsigned char>(s[b + 2])) == 'L' &&
+           std::toupper(static_cast<unsigned char>(s[b + 3])) == 'L';
 }
 
 bool SqlEngine::parse_numeric_literal(const std::string& s, DataType type, double& out) {
-    const std::string v = trim(s);
-    if (is_null_literal_ci(v)) {
+    if (is_null_literal_ci(s)) {
         return false;
     }
 
     if (type == DataType::kInt) {
         std::int64_t n = 0;
-        if (!fast_parse_int64(v, n)) {
+        if (!fast_parse_int64(s, n)) {
             return false;
         }
         out = static_cast<double>(n);
         return true;
     }
     if (type == DataType::kDecimal) {
-        return fast_parse_double(v, out);
+        return fast_parse_double(s, out);
     }
     if (type == DataType::kDatetime) {
         std::int64_t ts = 0;
-        if (!parse_datetime_to_unix(v, ts)) {
+        if (!parse_datetime_to_unix(trim(s), ts)) {
             return false;
         }
         out = static_cast<double>(ts);
@@ -2144,7 +2167,7 @@ bool SqlEngine::validate_typed_value(const Column& col,
     if (numeric_valid != nullptr) {
         *numeric_valid = false;
     }
-    value = trim(value);
+    trim_in_place(value);
     if (is_null_literal_ci(value)) {
         if (col.not_null || col.primary_key) {
             error = "NULL is not allowed for column " + col.name;

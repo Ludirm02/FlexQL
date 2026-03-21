@@ -55,7 +55,6 @@ private:
         int primary_key_col = -1;
         std::unordered_map<std::string, std::size_t> primary_index;
         std::vector<std::vector<NumericIndexEntry>> numeric_range_index;
-        std::vector<std::uint8_t> numeric_range_sorted;
         std::vector<std::vector<double>> numeric_column_values;
         std::vector<std::vector<std::uint8_t>> numeric_column_valid;
         std::vector<Row> rows;
@@ -185,7 +184,6 @@ private:
                                 std::string& error) const;
 
     mutable std::shared_mutex db_mutex_;
-    mutable std::mutex numeric_index_mutex_;
     std::unordered_map<std::string, Table> tables_;
     QueryCache cache_;
 };
