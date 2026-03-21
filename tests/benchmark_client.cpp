@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
     }
 
     auto t0 = std::chrono::steady_clock::now();
-    constexpr std::size_t kBatchSize = 1024;
+    constexpr std::size_t kBatchSize = 4096;
     for (std::size_t base = 1; base <= rows_to_insert; base += kBatchSize) {
         const std::size_t end = std::min(rows_to_insert + 1, base + kBatchSize);
         std::string sql;

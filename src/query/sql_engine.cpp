@@ -922,7 +922,8 @@ bool SqlEngine::parse_create_table(const std::string& sql,
                                    std::vector<Column>& columns,
                                    int& primary_col,
                                    std::string& error) const {
-    std::string s = trim(sql);
+    // Avoid trimming/copying — sql is already trimmed by execute()
+    const std::string& s = sql;
     std::string upper = to_upper(s);
     if (!starts_with_keyword(upper, kCreateTableKw)) {
         error = "expected CREATE TABLE";
@@ -1739,27 +1740,33 @@ std::vector<std::string> SqlEngine::split_csv(const std::string& s) {
 }
 
 std::string SqlEngine::unquote_literal(const std::string& s) {
-    std::string t = trim(s);
-    if (t.size() < 2) {
-        return t;
+    std::size_t b = 0;
+    while (b < s.size() && is_space_char(s[b])) ++b;
+    std::size_t e = s.size();
+    while (e > b && is_space_char(s[e - 1])) --e;
+
+    if (e - b < 2) {
+        return std::string(s.data() + b, e - b);
     }
 
-    if ((t.front() == '\'' && t.back() == '\'') || (t.front() == '"' && t.back() == '"')) {
-        char q = t.front();
+    const char front = s[b];
+    const char back  = s[e - 1];
+    if ((front == '\'' && back == '\'') || (front == '"' && back == '"')) {
+        char q = front;
         std::string out;
-        out.reserve(t.size() - 2);
-        for (std::size_t i = 1; i + 1 < t.size(); ++i) {
-            if (t[i] == q && i + 1 < t.size() - 1 && t[i + 1] == q) {
+        out.reserve(e - b - 2);
+        for (std::size_t i = b + 1; i < e - 1; ++i) {
+            if (s[i] == q && i + 1 < e - 1 && s[i + 1] == q) {
                 out.push_back(q);
                 ++i;
                 continue;
             }
-            out.push_back(t[i]);
+            out.push_back(s[i]);
         }
         return out;
     }
 
-    return t;
+    return std::string(s.data() + b, e - b);
 }
 
 std::int64_t SqlEngine::now_unix() {
