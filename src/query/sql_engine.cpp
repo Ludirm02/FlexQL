@@ -128,14 +128,16 @@ bool SqlEngine::execute(const std::string& sql, QueryResult& out, std::string& e
     out = QueryResult{};
     error.clear();
 
-    std::string normalized = trim(sql);
-    if (normalized.empty()) {
-        error = "empty SQL statement";
-        return false;
-    }
-    if (!normalized.empty() && normalized.back() == ';') {
+    // Fast path: avoid full string copy for INSERT batches
+    // Just check first non-space char and strip trailing semicolon in-place
+    const char* p = sql.c_str();
+    while (*p && is_space_char(*p)) ++p;
+    if (!*p) { error = "empty SQL statement"; return false; }
+
+    std::string normalized(p);
+    // Strip trailing whitespace and semicolon
+    while (!normalized.empty() && (is_space_char(normalized.back()) || normalized.back() == ';')) {
         normalized.pop_back();
-        normalized = trim(normalized);
     }
     if (normalized.empty()) {
         error = "empty SQL statement";
@@ -569,7 +571,9 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
 
             for (std::size_t i = 0; i < n; ++i) {
                 if (col_valid[i] == 0U) continue;
-                if (!row_alive(base.rows[i], now_ts)) continue;
+                // Fast expiry check inline — avoids function call overhead
+                const auto& r = base.rows[i];
+                if (r.expires_at_unix != 0 && r.expires_at_unix <= now_ts) continue;
                 const double lhs = col_vals[i];
                 bool pass = false;
                 if      (op == "=" )  pass = (lhs == rhs);
@@ -592,7 +596,7 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             if (!used_numeric_index) {
                 for (std::size_t row_idx = 0; row_idx < base.rows.size(); ++row_idx) {
                     const Row& row = base.rows[row_idx];
-                    if (!row_alive(row, now_ts)) {
+                    if (row.expires_at_unix != 0 && row.expires_at_unix <= now_ts) {
                         continue;
                     }
                     bool pass = false;
