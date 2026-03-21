@@ -142,7 +142,9 @@ bool SqlEngine::execute(const std::string& sql, QueryResult& out, std::string& e
         return false;
     }
 
-    std::string upper = to_upper(normalized);
+    // Only uppercase first 20 chars to detect command type
+    const std::size_t cmd_scan = std::min<std::size_t>(normalized.size(), 20);
+    std::string upper = to_upper(normalized.substr(0, cmd_scan));
     if (starts_with_keyword(upper, kCreateTableKw)) {
         std::unique_lock<std::shared_mutex> lock(db_mutex_);
         return execute_create_table(normalized, error);

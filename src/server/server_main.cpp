@@ -287,7 +287,10 @@ int main(int argc, char** argv) {
 
         int one_tcp = 1;
         (void)::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one_tcp, sizeof(one_tcp));
-
+        int rcvbuf = 1 << 20;
+        (void)::setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        int sndbuf = 1 << 20;
+        (void)::setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
         pool.submit([client_fd, &engine]() {
             handle_client(client_fd, &engine);
         });
