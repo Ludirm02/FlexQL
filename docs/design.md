@@ -1,6 +1,6 @@
 # FlexQL Design Document
 
-Repository Link: `SET_THIS_TO_YOUR_ACTUAL_GITHUB_REPOSITORY_URL_BEFORE_SUBMISSION`
+Repository Link: [`SET_THIS_TO_YOUR_ACTUAL_GITHUB_REPOSITORY_URL_BEFORE_SUBMISSION`](https://github.com/Ludirm02/FlexQL)
 
 ## 1. System Overview
 
