@@ -1,6 +1,7 @@
 #ifndef FLEXQL_SQL_ENGINE_HPP
 #define FLEXQL_SQL_ENGINE_HPP
 
+#include "robin_hood_index.hpp"
 #include <cstdint>
 #include <list>
 #include <mutex>
@@ -55,6 +56,8 @@ private:
         std::vector<std::vector<std::uint8_t>> numeric_column_valid;
         std::vector<Row> rows;
         std::uint64_t version = 1;
+        RobinHoodIndex pk_robin_index;   // replaces primary_index_int for INT PKs
+        bool pk_is_int = false;
     };
 
     struct Condition {
