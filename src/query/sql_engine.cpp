@@ -326,12 +326,12 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             }
         }
 
+        std::int64_t pk_int_val = 0;
         if (table.primary_key_col >= 0) {
             pk_key = row.values[static_cast<std::size_t>(table.primary_key_col)];
             if (table.pk_is_int) {
-                std::int64_t pk_int = 0;
-                fast_parse_int64(pk_key, pk_int);
-                auto idx_it = table.primary_index_int.find(pk_int);
+                fast_parse_int64(pk_key, pk_int_val);
+                auto idx_it = table.primary_index_int.find(pk_int_val);
                 if (idx_it != table.primary_index_int.end()) {
                     std::size_t row_idx = idx_it->second;
                     if (row_idx < table.rows.size() && row_alive(table.rows[row_idx], now_ts)) {
@@ -356,9 +356,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
 
         if (table.primary_key_col >= 0) {
             if (table.pk_is_int) {
-                std::int64_t pk_int = 0;
-                fast_parse_int64(pk_key, pk_int);
-                table.primary_index_int[pk_int] = row_idx;
+                table.primary_index_int[pk_int_val] = row_idx;
             } else {
                 table.primary_index[pk_key] = row_idx;
             }
@@ -1194,7 +1192,7 @@ bool SqlEngine::parse_insert(const std::string& sql,
                              std::vector<std::vector<std::string>>& rows,
                              std::vector<std::int64_t>& expires_at,
                              std::string& error) const {
-    std::string s = trim(sql);
+    const std::string& s = sql;
     // Only uppercase first 128 chars — INSERT INTO tablename VALUES always fits here
     // This avoids copying the entire 40KB batch INSERT string for case conversion
     const std::size_t header_scan = std::min<std::size_t>(s.size(), 128);
