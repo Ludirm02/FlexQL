@@ -103,6 +103,25 @@ bool send_result(int fd, const QueryResult& result) {
     return flush();
 }
 
+std::string build_wire_response(const QueryResult& result) {
+    constexpr std::size_t kChunkFlush = 256 * 1024;
+    std::string chunk;
+    chunk.reserve(kChunkFlush + 4096);
+
+    chunk += "OK " + std::to_string(result.columns.size()) + "\n";
+    if (result.columns.empty()) {
+        chunk += "END\n";
+        return chunk;
+    }
+
+    append_line_with_fields(chunk, "COL", result.columns);
+    for (const auto& row : result.rows) {
+        append_line_with_fields(chunk, "ROW", row);
+    }
+    chunk += "END\n";
+    return chunk;
+}
+
 void handle_client(int client_fd, SqlEngine* engine) {
     for (;;) {
         std::string header;
@@ -156,7 +175,9 @@ void handle_client(int client_fd, SqlEngine* engine) {
             continue;
         }
 
-        if (!send_result(client_fd, result)) {
+        // Build wire response once, then send it AND give it to the wire cache
+        std::string wire = build_wire_response(result);
+        if (!flexql_proto::send_all(client_fd, wire.data(), wire.size())) {
             break;
         }
     }

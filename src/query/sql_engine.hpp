@@ -44,7 +44,7 @@ private:
         std::int64_t expires_at_unix = 0;
     };
 
-   struct Table {
+    struct Table {
         std::string name;
         std::vector<Column> columns;
         std::unordered_map<std::string, std::size_t> column_index;
@@ -55,7 +55,7 @@ private:
         std::vector<std::vector<double>> numeric_column_values;
         std::vector<std::vector<std::uint8_t>> numeric_column_valid;
         std::vector<Row> rows;
-        std::vector<std::int64_t> expiry_col;  // parallel to rows — flat expiry array
+        std::vector<std::int64_t> expiry_col;
         std::uint64_t version = 1;
     };
 

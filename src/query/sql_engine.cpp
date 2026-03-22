@@ -279,6 +279,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             new_capacity *= 2;
         }
         table.rows.reserve(new_capacity);
+        table.expiry_col.reserve(new_capacity);
         reserve_numeric_aux(new_capacity);
     }
 
@@ -641,10 +642,10 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             }
             if (!used_numeric_index) {
                 for (std::size_t row_idx = 0; row_idx < base.rows.size(); ++row_idx) {
-                    const Row& row = base.rows[row_idx];
-                    if (row.expires_at_unix != 0 && row.expires_at_unix <= now_ts) {
+                    if (row_idx < base.expiry_col.size() && base.expiry_col[row_idx] != 0 && base.expiry_col[row_idx] <= now_ts) {
                         continue;
                     }
+                    const Row& row = base.rows[row_idx];
                     bool pass = false;
                     if (!passes_where(row_idx, pass)) {
                         return false;
