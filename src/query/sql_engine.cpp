@@ -348,6 +348,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             }
         }
 
+        table.rows.push_back(std::move(row));
         table.expiry_flat.push_back(table.rows.back().expires_at_unix);
         const std::size_t row_idx = table.rows.size() - 1;
 
@@ -611,18 +612,15 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
                 return true;
             }
             // Safety: expiry_flat must match rows size, fall back if not
-            const std::int64_t* __restrict__ expiry_ptr = base.expiry_flat.data();
             out.rows.reserve(std::max<std::size_t>(1024, n / 2));
 
             const double rhs = where_meta.rhs_numeric;
             const char op0   = where_meta.op0;
             const char op1   = where_meta.op1;
             const std::int64_t* __restrict__ expiry_ptr = base.expiry_flat.data();
-
             for (std::size_t i = 0; i < n; ++i) {
                 if (col_valid[i] == 0U) continue;
-                if (expiry_ptr && expiry_ptr[i] != 0 && expiry_ptr[i] <= now_ts) continue;
-                if (!expiry_ptr) { const auto& r = base.rows[i]; if (r.expires_at_unix != 0 && r.expires_at_unix <= now_ts) continue; }
+                if (expiry_ptr[i] != 0 && expiry_ptr[i] <= now_ts) continue;
                 const double lhs = col_vals[i];
                 bool pass;
                 if      (op0 == '=' && op1 == '\0') pass = (lhs == rhs);

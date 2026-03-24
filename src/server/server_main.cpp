@@ -103,25 +103,6 @@ bool send_result(int fd, const QueryResult& result) {
     return flush();
 }
 
-std::string build_wire_response(const QueryResult& result) {
-    constexpr std::size_t kChunkFlush = 256 * 1024;
-    std::string chunk;
-    chunk.reserve(kChunkFlush + 4096);
-
-    chunk += "OK " + std::to_string(result.columns.size()) + "\n";
-    if (result.columns.empty()) {
-        chunk += "END\n";
-        return chunk;
-    }
-
-    append_line_with_fields(chunk, "COL", result.columns);
-    for (const auto& row : result.rows) {
-        append_line_with_fields(chunk, "ROW", row);
-    }
-    chunk += "END\n";
-    return chunk;
-}
-
 void handle_client(int client_fd, SqlEngine* engine) {
     for (;;) {
         std::string header;
@@ -175,16 +156,45 @@ void handle_client(int client_fd, SqlEngine* engine) {
             continue;
         }
 
-        // Build wire response once, then send it AND give it to the wire cache
-        std::string wire = build_wire_response(result);
-        if (!flexql_proto::send_all(client_fd, wire.data(), wire.size())) {
-            break;
+        // Stream result directly — no intermediate copy
+        constexpr std::size_t kChunk = 256 * 1024;
+        std::string buf;
+        buf.reserve(kChunk + 4096);
+
+        buf += "OK ";
+        buf += std::to_string(result.columns.size());
+        buf += "\n";
+
+        if (result.columns.empty()) {
+            buf += "END\n";
+            if (!flexql_proto::send_all(client_fd, buf.data(), buf.size())) break;
+            continue;
         }
+
+        append_line_with_fields(buf, "COL", result.columns);
+
+        bool send_ok = true;
+        for (const auto& row : result.rows) {
+            append_line_with_fields(buf, "ROW", row);
+            if (buf.size() >= kChunk) {
+                if (!flexql_proto::send_all(client_fd, buf.data(), buf.size())) {
+                    send_ok = false;
+                    break;
+                }
+                buf.clear();
+            }
+        }
+
+        if (!send_ok) break;
+
+        buf += "END\n";
+        if (!flexql_proto::send_all(client_fd, buf.data(), buf.size())) break;
     }
 
     flexql_proto::clear_reader_state(client_fd);
     ::close(client_fd);
 }
+
 
 class ThreadPool {
 public:
