@@ -645,7 +645,6 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
                     if (row_idx < base.expiry_flat.size() && base.expiry_flat[row_idx] != 0 && base.expiry_flat[row_idx] <= now_ts) {
                         continue;
                     }
-                    const Row& row = base.rows[row_idx];
                     bool pass = false;
                     if (!passes_where(row_idx, pass)) {
                         return false;
@@ -875,6 +874,33 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
         return true;
     };
 
+    auto try_int_join_key = [&](const Table& table,
+                                std::size_t row_idx,
+                                std::size_t idx,
+                                std::int64_t& key_out) -> bool {
+        if (idx >= table.columns.size() || table.columns[idx].type != DataType::kInt) {
+            return false;
+        }
+
+        if (idx < table.numeric_column_valid.size() && idx < table.numeric_column_values.size() &&
+            row_idx < table.numeric_column_valid[idx].size() &&
+            row_idx < table.numeric_column_values[idx].size() &&
+            table.numeric_column_valid[idx][row_idx] != 0U) {
+            key_out = static_cast<std::int64_t>(table.numeric_column_values[idx][row_idx]);
+            return true;
+        }
+
+        if (row_idx >= table.rows.size() || idx >= table.rows[row_idx].values.size()) {
+            return false;
+        }
+
+        const std::string& raw = table.rows[row_idx].values[idx];
+        if (is_null_literal_ci(raw)) {
+            return false;
+        }
+        return fast_parse_int64(raw, key_out);
+    };
+
     const Table* hash_table = &base;
     const Table* probe_table = &right;
     std::size_t hash_idx = base_join_idx;
@@ -889,44 +915,30 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
         hash_is_base = false;
     }
 
-    // Use int64 hash map for INT joins only when both join columns are fully numeric-backed.
     std::unordered_map<std::int64_t, std::vector<std::size_t>> join_hash_int;
     std::unordered_map<std::string, std::vector<std::size_t>> join_hash_str;
     const bool join_use_int = (join_cmp_type == DataType::kInt);
-    const bool hash_int_backed = join_use_int &&
-        hash_idx < hash_table->numeric_column_valid.size() &&
-        hash_idx < hash_table->numeric_column_values.size() &&
-        hash_table->numeric_column_valid[hash_idx].size() == hash_table->rows.size() &&
-        hash_table->numeric_column_values[hash_idx].size() == hash_table->rows.size();
-    const bool probe_int_backed = join_use_int &&
-        probe_idx < probe_table->numeric_column_valid.size() &&
-        probe_idx < probe_table->numeric_column_values.size() &&
-        probe_table->numeric_column_valid[probe_idx].size() == probe_table->rows.size() &&
-        probe_table->numeric_column_values[probe_idx].size() == probe_table->rows.size();
-    const bool join_use_int_fast = hash_int_backed && probe_int_backed;
-
-    if (join_use_int_fast) {
+    if (join_use_int) {
         join_hash_int.reserve(hash_table->rows.size() > 0 ? hash_table->rows.size() : 1);
-    } else {
-        join_hash_str.reserve(hash_table->rows.size() > 0 ? hash_table->rows.size() : 1);
     }
+    join_hash_str.reserve(hash_table->rows.size() > 0 ? hash_table->rows.size() : 1);
 
     for (std::size_t hash_row_idx = 0; hash_row_idx < hash_table->rows.size(); ++hash_row_idx) {
         const Row& row = hash_table->rows[hash_row_idx];
         if (!row_alive(row, now_ts)) continue;
-        if (join_use_int_fast) {
-            if (hash_table->numeric_column_valid[hash_idx][hash_row_idx] == 0U) {
+        if (join_use_int) {
+            std::int64_t int_key = 0;
+            if (try_int_join_key(*hash_table, hash_row_idx, hash_idx, int_key)) {
+                join_hash_int[int_key].push_back(hash_row_idx);
                 continue;
             }
-            std::int64_t k = static_cast<std::int64_t>(hash_table->numeric_column_values[hash_idx][hash_row_idx]);
-            join_hash_int[k].push_back(hash_row_idx);
-        } else {
-            std::string key;
-            if (!make_join_key(*hash_table, hash_row_idx, hash_idx, key)) {
-                error = "failed to compute join key"; return false;
-            }
-            join_hash_str[key].push_back(hash_row_idx);
         }
+
+        std::string key;
+        if (!make_join_key(*hash_table, hash_row_idx, hash_idx, key)) {
+            error = "failed to compute join key"; return false;
+        }
+        join_hash_str[key].push_back(hash_row_idx);
     }
 
     for (std::size_t probe_row_idx = 0; probe_row_idx < probe_table->rows.size(); ++probe_row_idx) {
@@ -936,20 +948,24 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
         }
 
         std::vector<std::size_t>* hit_rows = nullptr;
-        if (join_use_int_fast) {
-            if (probe_table->numeric_column_valid[probe_idx][probe_row_idx] == 0U) {
-                continue;
+        if (join_use_int) {
+            std::int64_t int_key = 0;
+            if (try_int_join_key(*probe_table, probe_row_idx, probe_idx, int_key)) {
+                auto hit = join_hash_int.find(int_key);
+                if (hit != join_hash_int.end()) {
+                    hit_rows = &hit->second;
+                }
             }
-            std::int64_t k = static_cast<std::int64_t>(probe_table->numeric_column_values[probe_idx][probe_row_idx]);
-            auto hit = join_hash_int.find(k);
-            if (hit != join_hash_int.end()) hit_rows = &hit->second;
-        } else {
+        }
+        if (hit_rows == nullptr) {
             std::string key;
             if (!make_join_key(*probe_table, probe_row_idx, probe_idx, key)) {
                 error = "failed to compute join key"; return false;
             }
             auto hit = join_hash_str.find(key);
-            if (hit != join_hash_str.end()) hit_rows = &hit->second;
+            if (hit != join_hash_str.end()) {
+                hit_rows = &hit->second;
+            }
         }
         if (!hit_rows) continue;
 
@@ -1268,13 +1284,36 @@ bool SqlEngine::parse_insert(const std::string& sql,
             return false;
         }
 
-        std::string values_part = s.substr(pos + 1, close_paren - pos - 1);
-        auto raw_values = split_csv(values_part);
         std::vector<std::string> tuple_values;
-        tuple_values.reserve(raw_values.size());
-        for (const std::string& raw : raw_values) {
-            tuple_values.push_back(unquote_literal(raw));
+        tuple_values.reserve(8);
+        std::string token;
+        token.reserve(close_paren - pos);
+        bool tuple_in_single = false;
+        bool tuple_in_double = false;
+        for (std::size_t i = pos + 1; i < close_paren; ++i) {
+            const char c = s[i];
+            if (c == '\'' && !tuple_in_double) {
+                token.push_back(c);
+                if (i + 1 < close_paren && s[i + 1] == '\'') {
+                    token.push_back(s[++i]);
+                } else {
+                    tuple_in_single = !tuple_in_single;
+                }
+                continue;
+            }
+            if (c == '"' && !tuple_in_single) {
+                tuple_in_double = !tuple_in_double;
+                token.push_back(c);
+                continue;
+            }
+            if (c == ',' && !tuple_in_single && !tuple_in_double) {
+                tuple_values.push_back(unquote_literal(token));
+                token.clear();
+                continue;
+            }
+            token.push_back(c);
         }
+        tuple_values.push_back(unquote_literal(token));
         rows.push_back(std::move(tuple_values));
 
         pos = close_paren + 1;
