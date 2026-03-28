@@ -159,7 +159,8 @@ void handle_client(int client_fd, SqlEngine* engine) {
                     row_line += "\n";
                     flexql_proto::send_all(client_fd, row_line.data(), row_line.size());
                 }
-                std::string end_line = "END\n";
+                std::string end_line = raw_result.rows.empty() && raw_result.columns.empty() 
+                    ? "OK\nEND\n" : "END\n";
                 flexql_proto::send_all(client_fd, end_line.data(), end_line.size());
             }
             continue;
