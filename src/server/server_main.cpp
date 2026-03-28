@@ -146,22 +146,28 @@ void handle_client(int client_fd, SqlEngine* engine) {
                 std::string err_line = "ERROR: " + raw_error + "\nEND\n";
                 flexql_proto::send_all(client_fd, err_line.data(), err_line.size());
             } else {
+                // Build entire response in one buffer, one send call
+                std::string response;
+                response.reserve(64 + raw_result.rows.size() * 64);
                 for (const auto& row : raw_result.rows) {
-                    std::string row_line = "ROW ";
-                    row_line += std::to_string(raw_result.columns.size());
-                    row_line += " ";
+                    response += "ROW ";
+                    response += std::to_string(raw_result.columns.size());
+                    response += " ";
                     for (std::size_t i = 0; i < row.size(); ++i) {
                         const std::string& col_name = i < raw_result.columns.size() ? raw_result.columns[i] : "";
                         const std::string& val = row[i];
-                        row_line += std::to_string(col_name.size()) + ":" + col_name;
-                        row_line += std::to_string(val.size()) + ":" + val;
+                        response += std::to_string(col_name.size());
+                        response += ":";
+                        response += col_name;
+                        response += std::to_string(val.size());
+                        response += ":";
+                        response += val;
                     }
-                    row_line += "\n";
-                    flexql_proto::send_all(client_fd, row_line.data(), row_line.size());
+                    response += "\n";
                 }
-                std::string end_line = raw_result.rows.empty() && raw_result.columns.empty() 
+                response += (raw_result.rows.empty() && raw_result.columns.empty()) 
                     ? "OK\nEND\n" : "END\n";
-                flexql_proto::send_all(client_fd, end_line.data(), end_line.size());
+                flexql_proto::send_all(client_fd, response.data(), response.size());
             }
             continue;
         }
@@ -386,9 +392,9 @@ int main(int argc, char** argv) {
 
         int one_tcp = 1;
         (void)::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one_tcp, sizeof(one_tcp));
-        int rcvbuf = 4 << 20;
+        int rcvbuf = 16 << 20;
         (void)::setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-        int sndbuf = 4 << 20;
+        int sndbuf = 16 << 20;
         (void)::setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
         pool.submit([client_fd, &engine]() {
             handle_client(client_fd, &engine);
