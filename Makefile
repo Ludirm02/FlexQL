@@ -1,7 +1,7 @@
 CXX := g++
-OPTFLAGS ?= -O3 -DNDEBUG -flto -march=native -funroll-loops -fomit-frame-pointer -ffast-math -ftree-vectorize -fopenmp
+OPTFLAGS ?= -O3 -DNDEBUG -flto -march=native -funroll-loops -fomit-frame-pointer -ffast-math -ftree-vectorize -fopenmp -fno-plt -fno-semantic-interposition
 CXXFLAGS := $(OPTFLAGS) -std=c++17 -Wall -Wextra -Wpedantic -Iinclude -Isrc -Isrc/client -Isrc/server -Isrc/network -Isrc/query
-LDFLAGS := -pthread -flto -fopenmp
+LDFLAGS := -pthread -flto -fopenmp -fno-plt -fno-semantic-interposition
 BUILD_DIR := build
 BIN_DIR := bin
 
