@@ -143,26 +143,26 @@ int handle_text_response_with_first(FlexQL* db,
     std::string first_line;
     if (!read_line_with_prefix(db->fd, first, first_line)) {
         set_errmsg(errmsg, "failed to read server response");
-        return FLEXQL_PROTOCOL_ERROR;
+        return FLEXQL_ERROR;
     }
     if (first_line.rfind("ERR\t", 0) == 0) {
         set_errmsg(errmsg, flexql_proto::unescape_field(first_line.substr(4)));
-        return FLEXQL_SQL_ERROR;
+        return FLEXQL_ERROR;
     }
     if (first_line.rfind("OK ", 0) != 0) {
         set_errmsg(errmsg, "protocol error: expected OK header");
-        return FLEXQL_PROTOCOL_ERROR;
+        return FLEXQL_ERROR;
     }
     try {
         std::size_t consumed = 0;
         columns = std::stoi(first_line.substr(3), &consumed);
         if (consumed != first_line.substr(3).size() || columns < 0) {
             set_errmsg(errmsg, "protocol error: invalid column count");
-            return FLEXQL_PROTOCOL_ERROR;
+            return FLEXQL_ERROR;
         }
     } catch (const std::exception&) {
         set_errmsg(errmsg, "protocol error: invalid column count");
-        return FLEXQL_PROTOCOL_ERROR;
+        return FLEXQL_ERROR;
     }
 
     std::vector<std::string> col_names;
@@ -172,14 +172,14 @@ int handle_text_response_with_first(FlexQL* db,
         std::string cols_line;
         if (!flexql_proto::recv_line(db->fd, cols_line)) {
             set_errmsg(errmsg, "failed to read result columns");
-            return FLEXQL_PROTOCOL_ERROR;
+            return FLEXQL_ERROR;
         }
 
         bool ok = false;
         col_names = parse_prefixed_fields_copy(cols_line, "COL", ok);
         if (!ok || static_cast<int>(col_names.size()) != columns) {
             set_errmsg(errmsg, "protocol error: malformed column line");
-            return FLEXQL_PROTOCOL_ERROR;
+            return FLEXQL_ERROR;
         }
 
         name_ptrs.resize(col_names.size());
@@ -194,7 +194,7 @@ int handle_text_response_with_first(FlexQL* db,
         std::string line;
         if (!flexql_proto::recv_line(db->fd, line)) {
             set_errmsg(errmsg, "failed to read query result");
-            return FLEXQL_PROTOCOL_ERROR;
+            return FLEXQL_ERROR;
         }
 
         if (line == "END") {
@@ -203,7 +203,7 @@ int handle_text_response_with_first(FlexQL* db,
 
         if (!parse_row_fields_inplace(line, columns, value_ptrs)) {
             set_errmsg(errmsg, "protocol error: malformed row line");
-            return FLEXQL_PROTOCOL_ERROR;
+            return FLEXQL_ERROR;
         }
 
         if (callback != nullptr && !abort_requested) {
@@ -222,7 +222,7 @@ int handle_binary_response(int fd, flexql_callback callback, void* arg, char** e
     std::uint32_t rows = 0;
     if (!read_u32_be(fd, columns) || !read_u32_be(fd, rows)) {
         set_errmsg(errmsg, "protocol error: truncated binary header");
-        return FLEXQL_PROTOCOL_ERROR;
+        return FLEXQL_ERROR;
     }
 
     std::vector<std::string> col_names;
@@ -232,13 +232,13 @@ int handle_binary_response(int fd, flexql_callback callback, void* arg, char** e
         std::uint16_t len = 0;
         if (!read_u16_be(fd, len)) {
             set_errmsg(errmsg, "protocol error: truncated column metadata");
-            return FLEXQL_PROTOCOL_ERROR;
+            return FLEXQL_ERROR;
         }
         if (len > 0) {
             col_names[i].resize(len);
             if (!flexql_proto::recv_exact(fd, col_names[i].data(), len)) {
                 set_errmsg(errmsg, "protocol error: truncated column name");
-                return FLEXQL_PROTOCOL_ERROR;
+                return FLEXQL_ERROR;
             }
         } else {
             col_names[i].clear();
@@ -254,13 +254,13 @@ int handle_binary_response(int fd, flexql_callback callback, void* arg, char** e
             std::uint32_t len = 0;
             if (!read_u32_be(fd, len)) {
                 set_errmsg(errmsg, "protocol error: truncated row field length");
-                return FLEXQL_PROTOCOL_ERROR;
+                return FLEXQL_ERROR;
             }
             if (len > 0) {
                 row_values[c].resize(len);
                 if (!flexql_proto::recv_exact(fd, row_values[c].data(), len)) {
                     set_errmsg(errmsg, "protocol error: truncated row field");
-                    return FLEXQL_PROTOCOL_ERROR;
+                    return FLEXQL_ERROR;
                 }
             } else {
                 row_values[c].clear();
@@ -296,7 +296,7 @@ extern "C" int flexql_open(const char* host, int port, FlexQL** db) {
     std::string port_str = std::to_string(port);
     int rc = ::getaddrinfo(host, port_str.c_str(), &hints, &result);
     if (rc != 0) {
-        return FLEXQL_NETWORK_ERROR;
+        return FLEXQL_ERROR;
     }
 
     int fd = -1;
@@ -315,7 +315,7 @@ extern "C" int flexql_open(const char* host, int port, FlexQL** db) {
     ::freeaddrinfo(result);
 
     if (fd < 0) {
-        return FLEXQL_NETWORK_ERROR;
+        return FLEXQL_ERROR;
     }
 
     int one = 1;
@@ -324,7 +324,7 @@ extern "C" int flexql_open(const char* host, int port, FlexQL** db) {
     FlexQL* handle = new (std::nothrow) FlexQL;
     if (handle == nullptr) {
         ::close(fd);
-        return FLEXQL_NOMEM;
+        return FLEXQL_ERROR;
     }
 
     handle->fd = fd;
@@ -363,13 +363,13 @@ extern "C" int flexql_exec(FlexQL* db,
     std::string sql_text(sql);
     if (!flexql_proto::send_query(db->fd, sql_text, true)) {
         set_errmsg(errmsg, "failed to send query to server");
-        return FLEXQL_NETWORK_ERROR;
+        return FLEXQL_ERROR;
     }
 
     char frame_type = '\0';
     if (!flexql_proto::recv_exact(db->fd, &frame_type, 1)) {
         set_errmsg(errmsg, "failed to read server response");
-        return FLEXQL_PROTOCOL_ERROR;
+        return FLEXQL_ERROR;
     }
 
     if (static_cast<unsigned char>(frame_type) == 0x01U) {
@@ -379,16 +379,16 @@ extern "C" int flexql_exec(FlexQL* db,
         std::uint32_t err_len = 0;
         if (!read_u32_be(db->fd, err_len)) {
             set_errmsg(errmsg, "protocol error: truncated binary error");
-            return FLEXQL_PROTOCOL_ERROR;
+            return FLEXQL_ERROR;
         }
         std::string msg;
         msg.resize(err_len);
         if (err_len > 0 && !flexql_proto::recv_exact(db->fd, msg.data(), err_len)) {
             set_errmsg(errmsg, "protocol error: truncated binary error");
-            return FLEXQL_PROTOCOL_ERROR;
+            return FLEXQL_ERROR;
         }
         set_errmsg(errmsg, msg);
-        return FLEXQL_SQL_ERROR;
+        return FLEXQL_ERROR;
     }
 
     return handle_text_response_with_first(db, frame_type, callback, arg, errmsg);
