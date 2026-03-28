@@ -330,7 +330,16 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
     }
 
     if (tables_.count(table_name) != 0U) {
-    return true; // IF NOT EXISTS — silent no-op
+    // Clear existing data so re-creation acts as reset
+    Table& existing = tables_[table_name];
+    existing.rows.clear();
+    existing.expiry_flat.clear();
+    existing.primary_index.clear();
+    existing.pk_robin_index = RobinHoodIndex(1024);
+    for (auto& vec : existing.numeric_column_values) vec.clear();
+    for (auto& vec : existing.numeric_column_valid) vec.clear();
+    ++existing.version;
+    return true;
 }
 
     auto [table_it, inserted] = tables_.try_emplace(table_name);
