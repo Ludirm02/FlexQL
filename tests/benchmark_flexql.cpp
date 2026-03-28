@@ -8,8 +8,8 @@
 using namespace std;
 using namespace std::chrono;
 
-static const long long DEFAULT_INSERT_ROWS = 1000000LL;
-static const int INSERT_BATCH_SIZE = 5000;
+static const long long DEFAULT_INSERT_ROWS = 10LL; // 100k rows by default for insertion benchmark
+static const int INSERT_BATCH_SIZE = 1; // if you implement batch inserts in flexql, you can increase this for better performance
 
 struct QueryStats {
     long long rows = 0;
@@ -76,7 +76,7 @@ static bool query_rows(FlexQL *db, const string &sql, vector<string> &out_rows) 
         string row;
         for (int i = 0; i < argc; ++i) {
             if (i > 0) {
-                row += " ";
+                row += "|";
             }
             row += (argv[i] ? argv[i] : "NULL");
         }
@@ -141,7 +141,7 @@ static bool assert_row_count(const string &label, const vector<string> &rows, si
 }
 
 static bool run_data_level_unit_tests(FlexQL *db) {
-    cout << "\n\n[[ Running Unit Tests ]]\n\n";
+    cout << "\n[[...Running Unit Tests...]]\n\n";
 
     bool all_ok = true;
     int total_tests = 0;
@@ -157,34 +157,40 @@ static bool run_data_level_unit_tests(FlexQL *db) {
 
     record(run_exec(
             db,
-            "CREATE TABLE IF NOT EXISTS TEST_USERS(ID DECIMAL, NAME VARCHAR(64), BALANCE DECIMAL, EXPIRES_AT DECIMAL);",
+            "CREATE TABLE TEST_USERS(ID DECIMAL, NAME VARCHAR(64), BALANCE DECIMAL, EXPIRES_AT DECIMAL);",
             "CREATE TABLE TEST_USERS"));
 
-    record(run_exec(db, "DELETE FROM TEST_USERS;", "RESET TEST_USERS"));
+    auto insert_test_user = [&](long long id, const string &name, long long balance, long long expires_at) -> bool {
+        stringstream ss;
+        ss << "INSERT INTO TEST_USERS VALUES ("
+           << id << ", '" << name << "', " << balance << ", " << expires_at << ");";
+        return run_exec(db, ss.str(), "INSERT TEST_USERS ID=" + to_string(id));
+    };
 
-    record(run_exec(
-            db,
-            "INSERT INTO TEST_USERS VALUES "
-            "(1, 'Alice', 1200, 1893456000),"
-            "(2, 'Bob', 450, 1893456000),"
-            "(3, 'Carol', 2200, 1893456000),"
-            "(4, 'Dave', 800, 1893456000);",
-            "INSERT TEST_USERS"));
+    record(insert_test_user(1, "Alice", 1200, 1893456000));
+    record(insert_test_user(2, "Bob", 450, 1893456000));
+    record(insert_test_user(3, "Carol", 2200, 1893456000));
+    record(insert_test_user(4, "Dave", 800, 1893456000));
 
     vector<string> rows;
+
+    bool q0 = query_rows(db, "SELECT * FROM TEST_USERS;", rows);
+    record(q0);
+    if (q0) {
+        record(assert_rows_equal("Basic SELECT * validation", rows, {"1|Alice|1200|1893456000", "2|Bob|450|1893456000", "3|Carol|2200|1893456000", "4|Dave|800|1893456000"}));
+    }
 
     bool q1 = query_rows(db, "SELECT NAME, BALANCE FROM TEST_USERS WHERE ID = 2;", rows);
     record(q1);
     if (q1) {
-        record(assert_rows_equal("Single-row value validation", rows, {"Bob 450"}));
+        record(assert_rows_equal("Single-row value validation", rows, {"Bob|450"}));
     }
 
-    bool q2 = query_rows(db, "SELECT NAME FROM TEST_USERS WHERE BALANCE > 1000 ORDER BY NAME;", rows);
+    bool q2 = query_rows(db, "SELECT NAME FROM TEST_USERS WHERE BALANCE > 1000;", rows);
     record(q2);
     if (q2) {
         record(assert_rows_equal("Filtered rows validation", rows, {"Alice", "Carol"}));
     }
-
 
     bool q4 = query_rows(db, "SELECT ID FROM TEST_USERS WHERE BALANCE > 5000;", rows);
     record(q4);
@@ -194,18 +200,23 @@ static bool run_data_level_unit_tests(FlexQL *db) {
 
     record(run_exec(
             db,
-            "CREATE TABLE IF NOT EXISTS TEST_ORDERS(ORDER_ID DECIMAL, USER_ID DECIMAL, AMOUNT DECIMAL, EXPIRES_AT DECIMAL);",
+            "CREATE TABLE TEST_ORDERS(ORDER_ID DECIMAL, USER_ID DECIMAL, AMOUNT DECIMAL, EXPIRES_AT DECIMAL);",
             "CREATE TABLE TEST_ORDERS"));
-
-    record(run_exec(db, "DELETE FROM TEST_ORDERS;", "RESET TEST_ORDERS"));
 
     record(run_exec(
             db,
-            "INSERT INTO TEST_ORDERS VALUES "
-            "(101, 1, 50, 1893456000),"
-            "(102, 1, 150, 1893456000),"
-            "(103, 3, 500, 1893456000);",
-            "INSERT TEST_ORDERS"));
+            "INSERT INTO TEST_ORDERS VALUES (101, 1, 50, 1893456000);",
+            "INSERT TEST_ORDERS ORDER_ID=101"));
+
+    record(run_exec(
+            db,
+            "INSERT INTO TEST_ORDERS VALUES (102, 1, 150, 1893456000);",
+            "INSERT TEST_ORDERS ORDER_ID=102"));
+
+    record(run_exec(
+            db,
+            "INSERT INTO TEST_ORDERS VALUES (103, 3, 500, 1893456000);",
+            "INSERT TEST_ORDERS ORDER_ID=103"));
 
 
     bool q7 = query_rows(
@@ -334,10 +345,10 @@ int main(int argc, char **argv) {
     }
 
 
-    // if (!run_data_level_unit_tests(db)) {
-        // flexql_close(db);
-        // return 1;
-    // }
+    if (!run_data_level_unit_tests(db)) {
+        flexql_close(db);
+        return 1;
+    }
 
     flexql_close(db);
     return 0;

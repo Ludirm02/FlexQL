@@ -2512,6 +2512,11 @@ std::string SqlEngine::cell_value_string(const Table& table,
     }
 
     char buf[64];
+    // If whole number, format as integer to avoid scientific notation
+    if (numeric == static_cast<double>(static_cast<long long>(numeric))) {
+        auto conv = std::to_chars(buf, buf + sizeof(buf), static_cast<long long>(numeric));
+        if (conv.ec == std::errc{}) return std::string(buf, conv.ptr);
+    }
     auto conv = std::to_chars(buf, buf + sizeof(buf), numeric, std::chars_format::general);
     if (conv.ec == std::errc{}) return std::string(buf, conv.ptr);
     return std::to_string(numeric);

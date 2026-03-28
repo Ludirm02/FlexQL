@@ -143,13 +143,18 @@ void handle_client(int client_fd, SqlEngine* engine) {
             QueryResult raw_result;
             std::string raw_error;
             if (!engine->execute(sql, raw_result, raw_error)) {
-                std::string err_line = "ERROR: " + raw_error + "\n";
+                std::string err_line = "ERROR: " + raw_error + "\nEND\n";
                 flexql_proto::send_all(client_fd, err_line.data(), err_line.size());
             } else {
                 for (const auto& row : raw_result.rows) {
-                    std::string row_line = "ROW";
-                    for (const std::string& v : row) {
-                        row_line += " " + v;
+                    std::string row_line = "ROW ";
+                    row_line += std::to_string(raw_result.columns.size());
+                    row_line += " ";
+                    for (std::size_t i = 0; i < row.size(); ++i) {
+                        const std::string& col_name = i < raw_result.columns.size() ? raw_result.columns[i] : "";
+                        const std::string& val = row[i];
+                        row_line += std::to_string(col_name.size()) + ":" + col_name;
+                        row_line += std::to_string(val.size()) + ":" + val;
                     }
                     row_line += "\n";
                     flexql_proto::send_all(client_fd, row_line.data(), row_line.size());
