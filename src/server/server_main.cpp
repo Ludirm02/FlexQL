@@ -130,8 +130,32 @@ void handle_client(int client_fd, SqlEngine* engine) {
             want_binary = true;
             num_start = header.c_str() + 3;
         } else {
-            if (!send_error(client_fd, "protocol error: expected query header")) {
-                break;
+            // Raw protocol: treat entire header line as SQL (their flexql.cpp sends raw SQL)
+            std::string sql = header;
+            // Read more lines until we find a semicolon
+            while (sql.find(';') == std::string::npos) {
+                std::string more;
+                if (!flexql_proto::recv_line(client_fd, more)) {
+                    goto client_done;
+                }
+                sql += " " + more;
+            }
+            QueryResult raw_result;
+            std::string raw_error;
+            if (!engine->execute(sql, raw_result, raw_error)) {
+                std::string err_line = "ERROR: " + raw_error + "\n";
+                flexql_proto::send_all(client_fd, err_line.data(), err_line.size());
+            } else {
+                for (const auto& row : raw_result.rows) {
+                    std::string row_line = "ROW";
+                    for (const std::string& v : row) {
+                        row_line += " " + v;
+                    }
+                    row_line += "\n";
+                    flexql_proto::send_all(client_fd, row_line.data(), row_line.size());
+                }
+                std::string end_line = "END\n";
+                flexql_proto::send_all(client_fd, end_line.data(), end_line.size());
             }
             continue;
         }
@@ -225,6 +249,7 @@ void handle_client(int client_fd, SqlEngine* engine) {
         if (!flexql_proto::send_all(client_fd, buf.data(), buf.size())) break;
     }
 
+    client_done:
     flexql_proto::clear_reader_state(client_fd);
     ::close(client_fd);
 }
