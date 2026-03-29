@@ -388,7 +388,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    SqlEngine engine(512);
+    SqlEngine engine(2048);
 
     // WAL: replay on startup
     const std::string wal_path = "data/wal/wal.log";

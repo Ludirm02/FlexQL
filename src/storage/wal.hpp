@@ -53,6 +53,7 @@ public:
     ~WAL() { flush_all(); }
 
 private:
+    int flush_count_ = 0;
     void run() {
         while (true) {
             std::vector<std::string> batch;
@@ -70,7 +71,7 @@ private:
                 file_.write(reinterpret_cast<const char*>(&len), sizeof(len));
                 file_.write(sql.data(), len);
             }
-            file_.flush();
+            if (++flush_count_ % 16 == 0 || stopping_) file_.flush();
             if (stopping_) return;
         }
     }
