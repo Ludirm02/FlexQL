@@ -1,6 +1,6 @@
 # FlexQL Design Document
 
-Repository Link: `ADD_YOUR_GITHUB_URL_HERE`
+Repository Link: `https://github.com/Ludirm02/FlexQL`
 
 ---
 
@@ -303,3 +303,63 @@ Benchmark environment: Local Linux machine, `make -j$(nproc)` with `-O3 -DNDEBUG
 | Shared mutex for reads | N concurrent SELECTs with zero contention |
 | Thread pool | Eliminates per-connection thread creation overhead |
 
+
+---
+## 8. Persistence and Fault Tolerance
+
+### 8.1 Write-Ahead Log (WAL)
+FlexQL uses a WAL for persistence. Every `INSERT` and `CREATE TABLE` statement is appended to `data/wal/wal.log` before being applied to memory.
+
+**WAL Format:** Binary length-prefixed records — each entry is a 4-byte length followed by the SQL string. This allows fast sequential replay.
+
+**Async Writer:** WAL writes happen in a background thread to avoid blocking the insert path. The main thread enqueues SQL strings; the WAL worker drains the queue and writes to disk in batches using a 4MB write buffer, reducing syscall overhead.
+
+**Fault Tolerance:** On server startup, the WAL is replayed sequentially to rebuild all in-memory state. This ensures data survives crashes and restarts.
+
+**Trade-off:** RAM is used as primary working storage for fast query performance, with WAL providing durability. This follows the approach used by Redis (AOF mode) and early PostgreSQL designs.
+
+### 8.2 Batch INSERT Support
+Multi-row `INSERT INTO t VALUES (...),(...),...` is supported. The parser handles batches of arbitrary size. Batch size is configurable via `INSERT_BATCH_SIZE` in the benchmark — larger batches reduce network round-trips and improve throughput significantly.
+
+---
+## 9. Wire Protocol
+Two protocols are supported:
+- **Binary protocol** — used by the FlexQL client API for efficient data transfer
+- **Raw text protocol** — compatible with the reference `flexql.cpp` implementation. Responses use `ROW <count> <len>:<name><len>:<value>...\n` format followed by `END\n`
+
+---
+## 10. Performance Results
+- Insert throughput: ~540k rows/sec at 10M rows (on AMD Ryzen 5 5600H, 7.1GB RAM)
+- SELECT range scan: ~320ms for 600k rows
+- Memory footprint: ~495MB RSS for 10M rows
+- WAL overhead: <4% of insert time (fully async)
+
+---
+## 8. Persistence and Fault Tolerance
+
+### 8.1 Write-Ahead Log (WAL)
+FlexQL uses a WAL for persistence. Every `INSERT` and `CREATE TABLE` statement is appended to `data/wal/wal.log` before being applied to memory.
+
+**WAL Format:** Binary length-prefixed records — each entry is a 4-byte length followed by the SQL string. This allows fast sequential replay.
+
+**Async Writer:** WAL writes happen in a background thread to avoid blocking the insert path. The main thread enqueues SQL strings; the WAL worker drains the queue and writes to disk in batches using a 4MB write buffer, reducing syscall overhead.
+
+**Fault Tolerance:** On server startup, the WAL is replayed sequentially to rebuild all in-memory state. This ensures data survives crashes and restarts.
+
+**Trade-off:** RAM is used as primary working storage for fast query performance, with WAL providing durability. This follows the approach used by Redis (AOF mode) and early PostgreSQL designs.
+
+### 8.2 Batch INSERT Support
+Multi-row `INSERT INTO t VALUES (...),(...),...` is supported. The parser handles batches of arbitrary size. Batch size is configurable via `INSERT_BATCH_SIZE` in the benchmark — larger batches reduce network round-trips and improve throughput significantly.
+
+---
+## 9. Wire Protocol
+Two protocols are supported:
+- **Binary protocol** — used by the FlexQL client API for efficient data transfer
+- **Raw text protocol** — compatible with the reference `flexql.cpp` implementation. Responses use `ROW <count> <len>:<name><len>:<value>...\n` format followed by `END\n`
+
+---
+## 10. Performance Results
+- Insert throughput: ~540k rows/sec at 10M rows (on AMD Ryzen 5 5600H, 7.1GB RAM)
+- SELECT range scan: ~320ms for 600k rows
+- Memory footprint: ~495MB RSS for 10M rows
+- WAL overhead: <4% of insert time (fully async)
