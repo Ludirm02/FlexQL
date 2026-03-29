@@ -75,3 +75,12 @@ This will:
 3. Insert 10 million rows
 4. Run point queries, full scan, and cached query tests
 5. Print results and save to `docs/performance_results.txt`
+
+---
+## WAL Persistence
+The server automatically creates `data/wal/wal.log` for persistence.
+To start fresh (clear all data):
+```bash
+rm -f data/wal/wal.log
+```
+Data survives server restarts automatically via WAL replay.
