@@ -4,28 +4,26 @@
 #include <mutex>
 #include <vector>
 #include <cstdint>
+#include <thread>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
 
 class WAL {
 public:
-    static WAL& instance() {
-        static WAL w;
-        return w;
-    }
+    static WAL& instance() { static WAL w; return w; }
 
     bool open(const std::string& path) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        path_ = path;
         file_.open(path, std::ios::app | std::ios::binary);
-        return file_.is_open();
+        if (!file_.is_open()) return false;
+        worker_ = std::thread([this]() { run(); });
+        return true;
     }
 
     void log(const std::string& sql) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!file_.is_open()) return;
-        std::uint32_t len = static_cast<std::uint32_t>(sql.size());
-        file_.write(reinterpret_cast<const char*>(&len), sizeof(len));
-        file_.write(sql.data(), len);
-        file_.flush();
+        queue_.push(sql);
+        cv_.notify_one();
     }
 
     std::vector<std::string> replay(const std::string& path) {
@@ -41,8 +39,46 @@ public:
         return sqls;
     }
 
+    void flush_all() {
+        // Signal stop and wait for queue to drain
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+            cv_.notify_one();
+        }
+        if (worker_.joinable()) worker_.join();
+        if (file_.is_open()) file_.flush();
+    }
+
+    ~WAL() { flush_all(); }
+
 private:
+    void run() {
+        while (true) {
+            std::vector<std::string> batch;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this]{ return !queue_.empty() || stopping_; });
+                while (!queue_.empty()) {
+                    batch.push_back(std::move(queue_.front()));
+                    queue_.pop();
+                }
+                if (stopping_ && queue_.empty() && batch.empty()) return;
+            }
+            for (const auto& sql : batch) {
+                std::uint32_t len = static_cast<std::uint32_t>(sql.size());
+                file_.write(reinterpret_cast<const char*>(&len), sizeof(len));
+                file_.write(sql.data(), len);
+            }
+            file_.flush();
+            if (stopping_) return;
+        }
+    }
+
     std::ofstream file_;
     std::mutex mutex_;
-    std::string path_;
+    std::condition_variable cv_;
+    std::queue<std::string> queue_;
+    std::thread worker_;
+    bool stopping_ = false;
 };

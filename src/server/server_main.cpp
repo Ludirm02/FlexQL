@@ -8,8 +8,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <algorithm>
-#include <cctype>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -139,25 +137,17 @@ void handle_client(int client_fd, SqlEngine* engine) {
             while (sql.find(';') == std::string::npos) {
                 std::string more;
                 if (!flexql_proto::recv_line(client_fd, more)) {
-                    flexql_proto::clear_reader_state(client_fd);
-                    ::close(client_fd);
-                    return;
+                    goto client_done;
                 }
                 sql += " " + more;
             }
             QueryResult raw_result;
             std::string raw_error;
-            // WAL: persist INSERT and CREATE TABLE
-            {
-                const char* sp = sql.c_str();
-                while (*sp && (*sp<=' ')) sp++;
-                char up[8]={};
-                for (int i = 0; i < 7 && sp[i]; ++i) {
-                    up[i] = static_cast<char>(
-                        std::toupper(static_cast<unsigned char>(sp[i])));
-                }
-                if (std::strncmp(up, "INSERT", 6) == 0 ||
-                    std::strncmp(up, "CREATE", 6) == 0) {
+            // WAL: log before execute
+            if (sql.size() > 6) {
+                std::string sql_upper = sql.substr(0, 6);
+                for (auto& c : sql_upper) c = toupper(c);
+                if (sql_upper == "INSERT" || sql_upper == "CREATE") {
                     WAL::instance().log(sql);
                 }
             }
@@ -226,14 +216,10 @@ void handle_client(int client_fd, SqlEngine* engine) {
         std::string cached_wire;
         std::string error;
         // WAL: persist INSERT and CREATE TABLE
-        {
-            const char* sp = sql.c_str();
-            while (*sp && (*sp<=' ')) sp++;
-            char up[8]={};
-            for(int i=0;i<7&&sp[i];i++) up[i]=std::toupper(static_cast<unsigned char>(sp[i]));
-            if(std::strncmp(up,"INSERT",6)==0||std::strncmp(up,"CREATE",6)==0){
-                WAL::instance().log(sql);
-            }
+        if (sql.size() > 6) {
+            std::string su = sql.substr(0, 6);
+            for (auto& c : su) c = toupper(c);
+            if (su == "INSERT" || su == "CREATE") WAL::instance().log(sql);
         }
         if (!engine->execute(sql, result, error, &cached_wire, want_binary)) {
             const bool ok = want_binary ? send_error_binary(client_fd, error) : send_error(client_fd, error);
@@ -290,6 +276,7 @@ void handle_client(int client_fd, SqlEngine* engine) {
         if (!flexql_proto::send_all(client_fd, buf.data(), buf.size())) break;
     }
 
+    client_done:
     flexql_proto::clear_reader_state(client_fd);
     ::close(client_fd);
 }
@@ -403,10 +390,11 @@ int main(int argc, char** argv) {
 
     SqlEngine engine(512);
 
-    // WAL: replay on startup to restore persisted data
+    // WAL: replay on startup
+    const std::string wal_path = "data/wal/wal.log";
     {
         auto& wal = WAL::instance();
-        auto sqls = wal.replay("data/wal/wal.log");
+        auto sqls = wal.replay(wal_path);
         if (!sqls.empty()) {
             std::cout << "Replaying " << sqls.size() << " WAL entries...\n";
             for (const auto& sql : sqls) {
@@ -416,8 +404,9 @@ int main(int argc, char** argv) {
             }
             std::cout << "WAL replay complete.\n";
         }
-        wal.open("data/wal/wal.log");
+        wal.open(wal_path);
     }
+
     const std::size_t hw = std::thread::hardware_concurrency();
     ThreadPool pool(hw > 0 ? hw * 2 : 16);
     std::cout << "FlexQL server listening on port " << port << "\n";
@@ -445,6 +434,9 @@ int main(int argc, char** argv) {
         });
     }
 
+    WAL::instance().flush_all();
+    ::close(server_fd);
+    return 0;
     ::close(server_fd);
     return 0;
 }
