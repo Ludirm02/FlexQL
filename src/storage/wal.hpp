@@ -66,13 +66,15 @@ private:
                 }
                 if (stopping_ && queue_.empty() && batch.empty()) return;
             }
+            std::string buf;
+            buf.reserve(1 << 20);
             for (const auto& sql : batch) {
                 std::uint32_t len = static_cast<std::uint32_t>(sql.size());
-                file_.write(reinterpret_cast<const char*>(&len), sizeof(len));
-                file_.write(sql.data(), len);
+                buf.append(reinterpret_cast<const char*>(&len), sizeof(len));
+                buf.append(sql.data(), len);
             }
+            file_.write(buf.data(), buf.size());
             if (stopping_) { file_.flush(); return; }
-            if (stopping_) return;
         }
     }
 
