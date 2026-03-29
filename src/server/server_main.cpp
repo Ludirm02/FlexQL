@@ -148,7 +148,7 @@ void handle_client(int client_fd, SqlEngine* engine) {
                 std::string sql_upper = sql.substr(0, 6);
                 for (auto& c : sql_upper) c = toupper(c);
                 if (sql_upper == "INSERT" || sql_upper == "CREATE") {
-                    WAL::instance().log(sql);
+                    
                 }
             }
             if (!engine->execute(sql, raw_result, raw_error)) {

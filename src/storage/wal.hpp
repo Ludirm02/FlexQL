@@ -16,6 +16,7 @@ public:
     bool open(const std::string& path) {
         file_.open(path, std::ios::app | std::ios::binary);
         if (!file_.is_open()) return false;
+        file_.rdbuf()->pubsetbuf(walbuf_, sizeof(walbuf_));
         worker_ = std::thread([this]() { run(); });
         return true;
     }
@@ -53,6 +54,7 @@ public:
     ~WAL() { flush_all(); }
 
 private:
+    char walbuf_[4 * 1024 * 1024];
     int flush_count_ = 0;
     void run() {
         while (true) {
