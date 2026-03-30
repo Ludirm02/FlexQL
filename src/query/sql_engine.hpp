@@ -29,6 +29,7 @@ public:
     explicit SqlEngine(std::size_t cache_capacity = 256);
 
     bool execute(const std::string& sql, QueryResult& out, std::string& error);
+    void load_from_disk();
     bool execute(const std::string& sql,
                  QueryResult& out,
                  std::string& error,

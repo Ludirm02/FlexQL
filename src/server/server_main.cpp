@@ -1,3 +1,4 @@
+#include "storage/disk_store.hpp"
 #include "protocol.hpp"
 #include "sql_engine.hpp"
 #include "storage/wal.hpp"
@@ -389,9 +390,19 @@ int main(int argc, char** argv) {
     }
 
     SqlEngine engine(2048);
+    const std::string wal_path = "data/wal/wal.log";
+    {
+        auto schemas = DiskStore::load_schemas();
+        for (const auto& sql : schemas) {
+            QueryResult dummy; std::string err;
+            engine.execute(sql, dummy, err);
+        }
+        engine.load_from_disk();
+        std::cout << "Disk storage loaded.\n";
+        std::ofstream(wal_path, std::ios::trunc | std::ios::binary);
+    }
 
     // WAL: replay on startup
-    const std::string wal_path = "data/wal/wal.log";
     {
         auto& wal = WAL::instance();
         auto sqls = wal.replay(wal_path);

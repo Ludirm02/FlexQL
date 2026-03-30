@@ -1,3 +1,5 @@
+#include <thread>
+#include "storage/disk_store.hpp"
 #include "sql_engine.hpp"
 
 #pragma GCC optimize("O3,unroll-loops")
@@ -372,6 +374,7 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
         }
     }
 
+    DiskStore::write_schema(table_name, sql);
     return true;
 }
 
@@ -464,10 +467,13 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
     std::vector<std::uint8_t> parsed_numeric_valid(table.columns.size(), 0U);
 
     const std::int64_t now_ts = now_unix();
+    std::vector<std::vector<std::string>> disk_rows_for_disk;
+    disk_rows_for_disk.reserve(rows_values.size());
     for (std::size_t r = 0; r < rows_values.size(); ++r) {
         Row row;
         row.values = std::move(rows_values[r]);
         row.expires_at_unix = expires_at[r];
+        disk_rows_for_disk.push_back(row.values);
         std::string pk_key;
 
         if (row.values.size() != table.columns.size()) {
@@ -511,16 +517,13 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             }
         }
 
+        // DISK: capture original values before clearing for numeric cols
+        std::vector<std::string> disk_values = row.values;
         for (std::size_t i = 0; i < table.columns.size(); ++i) {
-            if (parsed_numeric_valid[i] == 0U) {
-                continue;
-            }
-            if (table.columns[i].type != DataType::kInt && table.columns[i].type != DataType::kDecimal) {
-                continue;
-            }
+            if (parsed_numeric_valid[i] == 0U) continue;
+            if (table.columns[i].type != DataType::kInt && table.columns[i].type != DataType::kDecimal) continue;
             row.values[i].clear();
         }
-
         table.rows.push_back(std::move(row));
         table.expiry_flat.push_back(table.rows.back().expires_at_unix);
         const std::size_t row_idx = table.rows.size() - 1;
@@ -546,6 +549,11 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
     }
 
     ++table.version;
+    // DISK: append rows to binary heap file
+    // Async disk write — don't block INSERT
+    std::thread([name = table.name, rows = disk_rows_for_disk, exp = expires_at]() {
+        DiskStore::append_rows(name, rows, exp);
+    }).detach();
     return true;
 }
 
@@ -2629,3 +2637,54 @@ bool SqlEngine::execute_delete(const std::string& sql, std::string& error) {
 }
 
 }  // namespace flexql
+void flexql::SqlEngine::load_from_disk() {
+    std::unique_lock<std::shared_mutex> lock(db_mutex_);
+    for (auto& [name, table] : tables_) {
+        auto disk_rows = DiskStore::load_rows(name);
+        if (disk_rows.empty()) continue;
+        table.rows.reserve(disk_rows.size());
+        table.expiry_flat.reserve(disk_rows.size());
+        for (size_t i = 0; i < table.columns.size(); ++i) {
+            if (table.columns[i].type == DataType::kInt ||
+                table.columns[i].type == DataType::kDecimal ||
+                table.columns[i].type == DataType::kDatetime) {
+                table.numeric_column_values[i].reserve(disk_rows.size());
+                table.numeric_column_valid[i].reserve(disk_rows.size());
+            }
+        }
+        for (auto& dr : disk_rows) {
+            if (dr.values.size() != table.columns.size()) continue;
+            Row row;
+            row.expires_at_unix = dr.expires_at;
+            row.values = dr.values;
+            std::string err;
+            for (size_t i = 0; i < table.columns.size(); ++i) {
+                double parsed = 0.0; bool nvalid = false;
+                validate_typed_value(table.columns[i], row.values[i], err, &parsed, &nvalid);
+                if (table.columns[i].type == DataType::kInt ||
+                    table.columns[i].type == DataType::kDecimal ||
+                    table.columns[i].type == DataType::kDatetime) {
+                    table.numeric_column_values[i].push_back(nvalid ? parsed : 0.0);
+                    table.numeric_column_valid[i].push_back(nvalid ? 1 : 0);
+                    if (nvalid && (table.columns[i].type == DataType::kInt ||
+                                  table.columns[i].type == DataType::kDecimal))
+                        row.values[i].clear();
+                }
+            }
+            size_t ridx = table.rows.size();
+            if (table.primary_key_col >= 0) {
+                const std::string& pkval = dr.values[table.primary_key_col];
+                if (table.pk_is_int) {
+                    int64_t pk = 0;
+                    fast_parse_int64(pkval, pk);
+                    table.pk_robin_index.insert(pk, ridx);
+                } else {
+                    table.primary_index[pkval] = ridx;
+                }
+            }
+            table.expiry_flat.push_back(row.expires_at_unix);
+            table.rows.push_back(std::move(row));
+        }
+        ++table.version;
+    }
+}
