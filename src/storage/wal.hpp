@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <fcntl.h>
 #pragma once
 #include <string>
 #include <fstream>
@@ -16,6 +17,7 @@ public:
 
     bool open(const std::string& path) {
         file_.open(path, std::ios::app | std::ios::binary);
+        fd_ = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT, 0644);
         if (!file_.is_open()) return false;
         file_.rdbuf()->pubsetbuf(walbuf_, sizeof(walbuf_));
         worker_ = std::thread([this]() { run(); });
@@ -42,20 +44,24 @@ public:
     }
 
     void flush_all() {
-        // Signal stop and wait for queue to drain
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stopping_ = true;
             cv_.notify_one();
         }
         if (worker_.joinable()) worker_.join();
-        if (file_.is_open()) file_.flush();
+        if (file_.is_open()) {
+            file_.flush();
+            file_.close();
+        }
+        if (fd_ >= 0) { ::fdatasync(fd_); ::close(fd_); fd_ = -1; }
     }
 
     ~WAL() { flush_all(); }
 
 private:
     char walbuf_[4 * 1024 * 1024];
+    int fd_ = -1;
     int flush_count_ = 0;
     void run() {
         while (true) {
@@ -78,7 +84,7 @@ private:
             }
             file_.write(buf.data(), buf.size());
             file_.flush();
-            ::fdatasync(fileno(fopen(("data/wal/wal.log"), "a")));
+            if (fd_ >= 0) ::fdatasync(fd_);
             if (stopping_) return;
         }
     }

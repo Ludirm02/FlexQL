@@ -49,6 +49,7 @@ inline std::vector<std::string> load_schemas() {
 inline void write_rows_to_file(const std::string& table_name,
                                 const std::vector<std::vector<std::string>>& rows,
                                 const std::vector<std::int64_t>& expires_at) {
+    std::filesystem::create_directories("data/tables");
     std::string path = "data/tables/" + table_name + ".bin";
     std::ofstream f(path, std::ios::binary | std::ios::app);
     if (!f.is_open()) return;
@@ -158,6 +159,11 @@ inline void truncate_table(const std::string& table_name) {
     std::ofstream(("data/tables/" + table_name + ".bin").c_str(),
                   std::ios::binary | std::ios::trunc);
     std::filesystem::remove("data/tables/" + table_name + ".schema");
+}
+
+inline void truncate_data(const std::string& table_name) {
+    std::string path = "data/tables/" + table_name + ".bin";
+    std::ofstream(path.c_str(), std::ios::binary | std::ios::trunc);
 }
 
 } // namespace DiskStore

@@ -523,6 +523,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             if (table.columns[i].type != DataType::kInt && table.columns[i].type != DataType::kDecimal) continue;
             row.values[i].clear();
         }
+        disk_rows_for_disk.push_back(std::move(disk_values));
         table.rows.push_back(std::move(row));
         table.expiry_flat.push_back(table.rows.back().expires_at_unix);
         const std::size_t row_idx = table.rows.size() - 1;
@@ -548,8 +549,10 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
     }
 
     ++table.version;
-    // DISK: append rows to binary heap file
-    // disk write handled by WAL — WAL IS the disk log
+    // Persist rows to disk (.bin heap file) via async writer
+    if (!skip_disk_write_) {
+        DiskStore::append_rows(table_name, disk_rows_for_disk, expires_at);
+    }
     return true;
 }
 
@@ -2735,5 +2738,28 @@ void flexql::SqlEngine::load_from_disk() {
             table.rows.push_back(std::move(row));
         }
         ++table.version;
+    }
+}
+
+void flexql::SqlEngine::checkpoint_to_disk() {
+    std::shared_lock<std::shared_mutex> lock(db_mutex_);
+    for (auto& [name, table] : tables_) {
+        std::shared_lock<std::shared_mutex> tlock(table.mutex);
+        DiskStore::truncate_data(name);
+        if (table.rows.empty()) continue;
+        std::vector<std::vector<std::string>> rows;
+        std::vector<std::int64_t> expires;
+        rows.reserve(table.rows.size());
+        expires.reserve(table.rows.size());
+        for (std::size_t i = 0; i < table.rows.size(); ++i) {
+            std::vector<std::string> row_vals;
+            row_vals.reserve(table.columns.size());
+            for (std::size_t j = 0; j < table.columns.size(); ++j) {
+                row_vals.push_back(cell_value_string(table, i, j));
+            }
+            rows.push_back(std::move(row_vals));
+            expires.push_back(table.rows[i].expires_at_unix);
+        }
+        DiskStore::write_rows_to_file(name, rows, expires);
     }
 }

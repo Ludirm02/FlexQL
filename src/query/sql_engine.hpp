@@ -30,6 +30,8 @@ public:
 
     bool execute(const std::string& sql, QueryResult& out, std::string& error);
     void load_from_disk();
+    void set_skip_disk_write(bool v) { skip_disk_write_ = v; }
+    void checkpoint_to_disk();
     bool execute(const std::string& sql,
                  QueryResult& out,
                  std::string& error,
@@ -213,6 +215,7 @@ private:
     mutable std::shared_mutex db_mutex_;
     std::unordered_map<std::string, Table> tables_;
     QueryCache cache_;
+    bool skip_disk_write_ = false;
 };
 
 }  // namespace flexql

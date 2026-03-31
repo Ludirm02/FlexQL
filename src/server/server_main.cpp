@@ -408,11 +408,14 @@ int main(int argc, char** argv) {
         auto sqls = wal.replay(wal_path);
         if (!sqls.empty()) {
             std::cout << "Replaying " << sqls.size() << " WAL entries...\n";
+            engine.set_skip_disk_write(true);
             for (const auto& sql : sqls) {
                 QueryResult dummy;
                 std::string err;
                 engine.execute(sql, dummy, err);
             }
+            engine.set_skip_disk_write(false);
+            engine.checkpoint_to_disk();
             std::cout << "WAL replay complete.\n";
         }
         std::ofstream(wal_path, std::ios::trunc | std::ios::binary);
@@ -447,8 +450,6 @@ int main(int argc, char** argv) {
     }
 
     WAL::instance().flush_all();
-    ::close(server_fd);
-    return 0;
     ::close(server_fd);
     return 0;
 }
