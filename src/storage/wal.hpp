@@ -1,3 +1,4 @@
+#include <unistd.h>
 #pragma once
 #include <string>
 #include <fstream>
@@ -76,7 +77,9 @@ private:
                 buf.append(sql.data(), len);
             }
             file_.write(buf.data(), buf.size());
-            if (stopping_) { file_.flush(); file_.sync_with_stdio(false); return; }
+            file_.flush();
+            ::fdatasync(fileno(fopen(("data/wal/wal.log"), "a")));
+            if (stopping_) return;
         }
     }
 

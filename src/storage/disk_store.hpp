@@ -68,6 +68,7 @@ inline void write_rows_to_file(const std::string& table_name,
         }
     }
     f.write(buf.data(), buf.size());
+    f.flush();
 }
 
 class AsyncWriter {
