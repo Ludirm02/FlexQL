@@ -1224,8 +1224,13 @@ bool SqlEngine::execute_select(const std::string& sql,
                     std::string pk, hk;
                     make_join_key(*probe_table, probe_row_idx, probe_idx, pk);
                     make_join_key(*hash_table, hash_row_idx, hash_idx, hk);
-                    lhs_ok = fast_parse_double(pk, lhs);
-                    rhs_ok = fast_parse_double(hk, rhs);
+                    // Strip type prefix (D:, I:, T:, S:, N:)
+                    auto strip = [](const std::string& s) {
+                        if (s.size() > 2 && s[1] == ':') return s.substr(2);
+                        return s;
+                    };
+                    lhs_ok = fast_parse_double(strip(pk), lhs);
+                    rhs_ok = fast_parse_double(strip(hk), rhs);
                     if (!lhs_ok || !rhs_ok) continue;
                 }
                 bool pass = false;

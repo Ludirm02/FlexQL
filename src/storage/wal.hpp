@@ -76,7 +76,7 @@ private:
                 buf.append(sql.data(), len);
             }
             file_.write(buf.data(), buf.size());
-            if (stopping_) { file_.flush(); return; }
+            if (stopping_) { file_.flush(); file_.sync_with_stdio(false); return; }
         }
     }
 
