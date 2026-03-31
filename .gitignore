@@ -4,3 +4,6 @@ data/wal/wal.log
 data/tables/*.bin
 data/tables/*.schema
 data/wal/wal.log
+data/tables/*.bin
+data/tables/*.schema
+data/wal/wal.log
