@@ -473,7 +473,6 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
         Row row;
         row.values = std::move(rows_values[r]);
         row.expires_at_unix = expires_at[r];
-        disk_rows_for_disk.push_back(row.values);
         std::string pk_key;
 
         if (row.values.size() != table.columns.size()) {
@@ -550,10 +549,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
 
     ++table.version;
     // DISK: append rows to binary heap file
-    // Async disk write — don't block INSERT
-    std::thread([name = table.name, rows = disk_rows_for_disk, exp = expires_at]() {
-        DiskStore::append_rows(name, rows, exp);
-    }).detach();
+    // disk write handled by WAL — WAL IS the disk log
     return true;
 }
 
@@ -1162,6 +1158,7 @@ bool SqlEngine::execute_select(const std::string& sql,
     std::unordered_map<std::int64_t, std::vector<std::size_t>> join_hash_int;
     std::unordered_map<std::string, std::vector<std::size_t>> join_hash_str;
     const bool join_use_int = (join_cmp_type == DataType::kInt);
+    const bool join_is_eq = (plan.join_op == "=");
     if (join_use_int) {
         join_hash_int.reserve(hash_table->rows.size() > 0 ? hash_table->rows.size() : 1);
     }
@@ -1191,27 +1188,62 @@ bool SqlEngine::execute_select(const std::string& sql,
             continue;
         }
 
+        std::vector<std::size_t> nl_matches;
         std::vector<std::size_t>* hit_rows = nullptr;
-        if (join_use_int) {
-            std::int64_t int_key = 0;
-            if (try_int_join_key(*probe_table, probe_row_idx, probe_idx, int_key)) {
-                auto hit = join_hash_int.find(int_key);
-                if (hit != join_hash_int.end()) {
-                    hit_rows = &hit->second;
+        if (join_is_eq) {
+            if (join_use_int) {
+                std::int64_t int_key = 0;
+                if (try_int_join_key(*probe_table, probe_row_idx, probe_idx, int_key)) {
+                    auto hit = join_hash_int.find(int_key);
+                    if (hit != join_hash_int.end()) hit_rows = &hit->second;
                 }
             }
-        }
-        if (hit_rows == nullptr) {
-            std::string key;
-            if (!make_join_key(*probe_table, probe_row_idx, probe_idx, key)) {
-                error = "failed to compute join key"; return false;
+            if (hit_rows == nullptr) {
+                std::string key;
+                if (!make_join_key(*probe_table, probe_row_idx, probe_idx, key)) {
+                    error = "failed to compute join key"; return false;
+                }
+                auto hit = join_hash_str.find(key);
+                if (hit != join_hash_str.end()) hit_rows = &hit->second;
             }
-            auto hit = join_hash_str.find(key);
-            if (hit != join_hash_str.end()) {
-                hit_rows = &hit->second;
+            if (!hit_rows) continue;
+        } else {
+            // Non-equality JOIN: nested loop over hash table rows
+            for (std::size_t hash_row_idx = 0; hash_row_idx < hash_table->rows.size(); ++hash_row_idx) {
+                if (!row_alive(hash_table->rows[hash_row_idx], now_ts)) continue;
+                double lhs = 0.0, rhs = 0.0;
+                bool lhs_ok = false, rhs_ok = false;
+                if (join_use_int) {
+                    std::int64_t a = 0, b = 0;
+                    lhs_ok = try_int_join_key(*probe_table, probe_row_idx, probe_idx, a);
+                    rhs_ok = try_int_join_key(*hash_table, hash_row_idx, hash_idx, b);
+                    if (lhs_ok) lhs = static_cast<double>(a);
+                    if (rhs_ok) rhs = static_cast<double>(b);
+                }
+                if (!lhs_ok || !rhs_ok) {
+                    std::string pk, hk;
+                    make_join_key(*probe_table, probe_row_idx, probe_idx, pk);
+                    make_join_key(*hash_table, hash_row_idx, hash_idx, hk);
+                    lhs_ok = fast_parse_double(pk, lhs);
+                    rhs_ok = fast_parse_double(hk, rhs);
+                    if (!lhs_ok || !rhs_ok) continue;
+                }
+                bool pass = false;
+                // If hash_is_base is false, probe=base and hash=right — operator is correct
+                // If hash_is_base is true, probe=right and hash=base — flip operator
+                std::string effective_op = plan.join_op;
+                if (hash_is_base) {
+                    if (plan.join_op == ">") effective_op = "<";
+                    else if (plan.join_op == "<") effective_op = ">";
+                    else if (plan.join_op == ">=") effective_op = "<=";
+                    else if (plan.join_op == "<=") effective_op = ">=";
+                }
+                eval_numeric_op(lhs, rhs, effective_op, pass);
+                if (pass) nl_matches.push_back(hash_row_idx);
             }
+            hit_rows = &nl_matches;
+            if (nl_matches.empty()) continue;
         }
-        if (!hit_rows) continue;
 
         for (std::size_t matched_row_idx : *hit_rows) {
             const std::size_t base_row_idx = hash_is_base ? matched_row_idx : probe_row_idx;
@@ -1789,13 +1821,25 @@ bool SqlEngine::parse_select(const std::string& sql, SelectPlan& plan, std::stri
             where_clause = trim(on_remainder.substr(where_on_pos + std::strlen("WHERE")));
         }
 
-        std::size_t eq = join_condition.find('=');
-        if (eq == std::string::npos) {
-            error = "join condition must contain '='";
-            return false;
+        // Support =, >=, <=, >, < in JOIN ON
+        std::string join_op;
+        std::size_t eq = std::string::npos;
+        for (std::size_t i = 0; i + 1 < join_condition.size(); ++i) {
+            if ((join_condition[i] == '>' || join_condition[i] == '<') && join_condition[i+1] == '=') {
+                join_op = join_condition.substr(i, 2); eq = i; break;
+            }
         }
+        if (eq == std::string::npos) {
+            for (std::size_t i = 0; i < join_condition.size(); ++i) {
+                if (join_condition[i] == '=' || join_condition[i] == '>' || join_condition[i] == '<') {
+                    join_op = join_condition.substr(i, 1); eq = i; break;
+                }
+            }
+        }
+        if (eq == std::string::npos) { error = "join condition must contain operator"; return false; }
         plan.join_left = trim(join_condition.substr(0, eq));
-        plan.join_right = trim(join_condition.substr(eq + 1));
+        plan.join_right = trim(join_condition.substr(eq + join_op.size()));
+        plan.join_op = join_op;
         if (plan.join_left.empty() || plan.join_right.empty()) {
             error = "invalid join condition";
             return false;

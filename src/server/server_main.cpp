@@ -149,7 +149,7 @@ void handle_client(int client_fd, SqlEngine* engine) {
                 std::string sql_upper = sql.substr(0, 6);
                 for (auto& c : sql_upper) c = toupper(c);
                 if (sql_upper == "INSERT" || sql_upper == "CREATE") {
-                    
+                    WAL::instance().log(sql);
                 }
             }
             if (!engine->execute(sql, raw_result, raw_error)) {
@@ -390,6 +390,7 @@ int main(int argc, char** argv) {
     }
 
     SqlEngine engine(2048);
+    DiskStore::AsyncWriter::instance().start();
     const std::string wal_path = "data/wal/wal.log";
     {
         auto schemas = DiskStore::load_schemas();
@@ -399,10 +400,9 @@ int main(int argc, char** argv) {
         }
         engine.load_from_disk();
         std::cout << "Disk storage loaded.\n";
-        std::ofstream(wal_path, std::ios::trunc | std::ios::binary);
     }
 
-    // WAL: replay on startup
+    // WAL: replay crash recovery tail then truncate
     {
         auto& wal = WAL::instance();
         auto sqls = wal.replay(wal_path);
@@ -415,6 +415,7 @@ int main(int argc, char** argv) {
             }
             std::cout << "WAL replay complete.\n";
         }
+        std::ofstream(wal_path, std::ios::trunc | std::ios::binary);
         wal.open(wal_path);
     }
 

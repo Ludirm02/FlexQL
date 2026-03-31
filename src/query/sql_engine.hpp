@@ -80,6 +80,7 @@ private:
         bool has_join = false;
         std::string join_left;
         std::string join_right;
+        std::string join_op = "=";
         std::vector<std::string> select_columns;
         bool select_star = false;
         Condition where;
