@@ -341,6 +341,7 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
     for (auto& vec : existing.numeric_column_values) vec.clear();
     for (auto& vec : existing.numeric_column_valid) vec.clear();
     ++existing.version;
+    DiskStore::truncate_data(table_name);
     return true;
 }
 

@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +25,12 @@
 #include <vector>
 
 namespace {
+
+static std::atomic<bool> g_shutdown{false};
+
+void shutdown_handler(int /*sig*/) {
+    g_shutdown.store(true, std::memory_order_relaxed);
+}
 
 using flexql::QueryResult;
 using flexql::SqlEngine;
@@ -347,6 +354,8 @@ private:
 
 int main(int argc, char** argv) {
     std::signal(SIGPIPE, SIG_IGN);
+    std::signal(SIGINT, shutdown_handler);
+    std::signal(SIGTERM, shutdown_handler);
 
     int port = 9000;
     if (argc >= 2) {
@@ -432,10 +441,15 @@ int main(int argc, char** argv) {
         int client_fd = ::accept(server_fd, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
         if (client_fd < 0) {
             if (errno == EINTR) {
+                if (g_shutdown.load(std::memory_order_relaxed)) break;
                 continue;
             }
             std::perror("accept");
             continue;
+        }
+        if (g_shutdown.load(std::memory_order_relaxed)) {
+            ::close(client_fd);
+            break;
         }
 
         int one_tcp = 1;
@@ -449,6 +463,8 @@ int main(int argc, char** argv) {
         });
     }
 
+    std::cout << "Shutting down...\n";
+    DiskStore::AsyncWriter::instance().stop();
     WAL::instance().flush_all();
     ::close(server_fd);
     return 0;
