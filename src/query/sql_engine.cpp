@@ -1,3 +1,4 @@
+#include "../storage/table_iterator.hpp"
 #include <thread>
 #include "storage/disk_store.hpp"
 #include "sql_engine.hpp"
@@ -354,6 +355,8 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
     t.name = table_name;
     t.columns = columns;
     t.primary_key_col = primary_col;
+    t.disk_mgr = std::make_unique<DiskManager>(table_name);
+    t.buf_pool = std::make_unique<BufferPoolManager>(*t.disk_mgr, 32768);
 
     t.numeric_column_values.resize(t.columns.size());
     t.numeric_column_valid.resize(t.columns.size());
@@ -553,6 +556,38 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
     // Persist rows to disk (.bin heap file) via async writer
     if (!skip_disk_write_) {
         DiskStore::append_rows(table_name, disk_rows_for_disk, expires_at);
+        // Buffer pool: write rows to 8KB pages
+        if (table.buf_pool && table.disk_mgr) {
+            for (std::size_t r = 0; r < disk_rows_for_disk.size(); ++r) {
+                std::string serialized = serialize_row(
+                    disk_rows_for_disk[r],
+                    r < expires_at.size() ? expires_at[r] : 0);
+                bool written = false;
+                // Try last page first
+                if (table.last_page_id != INVALID_PAGE_ID) {
+                    Frame* f = table.buf_pool->pin(table.last_page_id);
+                    if (f) {
+                        if (f->page.append(serialized.data(),
+                            static_cast<uint16_t>(serialized.size())) >= 0) {
+                            table.buf_pool->unpin(table.last_page_id, true);
+                            written = true;
+                        } else {
+                            table.buf_pool->unpin(table.last_page_id, false);
+                        }
+                    }
+                }
+                if (!written) {
+                    page_id_t new_pid;
+                    Frame* f = table.buf_pool->new_page(new_pid);
+                    if (f) {
+                        f->page.append(serialized.data(),
+                            static_cast<uint16_t>(serialized.size()));
+                        table.buf_pool->unpin(new_pid, true);
+                        table.last_page_id = new_pid;
+                    }
+                }
+            }
+        }
     }
     return true;
 }
@@ -2693,7 +2728,25 @@ bool SqlEngine::execute_delete(const std::string& sql, std::string& error) {
 void flexql::SqlEngine::load_from_disk() {
     std::unique_lock<std::shared_mutex> lock(db_mutex_);
     for (auto& [name, table] : tables_) {
-        auto disk_rows = DiskStore::load_rows(name);
+        // Try loading from buffer pool .db pages first (faster aligned reads)
+        // Fall back to .bin file if .db doesn't exist
+        std::vector<DiskRow> disk_rows;
+        bool loaded_from_pages = false;
+        if (table.buf_pool && table.disk_mgr && table.disk_mgr->num_pages() > 0) {
+            TableIterator it(*table.buf_pool, table.disk_mgr->num_pages());
+            while (it.valid()) {
+                const PageRow& pr = it.current();
+                DiskRow dr;
+                dr.values = pr.values;
+                dr.expires_at = pr.expires_at;
+                disk_rows.push_back(std::move(dr));
+                it.next();
+            }
+            loaded_from_pages = !disk_rows.empty();
+        }
+        if (!loaded_from_pages) {
+            disk_rows = DiskStore::load_rows(name);
+        }
         if (disk_rows.empty()) continue;
         table.rows.reserve(disk_rows.size());
         table.expiry_flat.reserve(disk_rows.size());

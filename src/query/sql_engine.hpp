@@ -2,6 +2,9 @@
 #define FLEXQL_SQL_ENGINE_HPP
 
 #include "robin_hood_index.hpp"
+#include "../storage/disk_manager.hpp"
+#include "../storage/buffer_pool.hpp"
+#include "../storage/table_iterator.hpp"
 #include <cstdint>
 #include <list>
 #include <mutex>
@@ -66,6 +69,9 @@ private:
         std::vector<std::int64_t> expiry_flat;   // parallel to rows[], for SIMD scan
         std::vector<Row> rows;
         std::uint64_t version = 1;
+        std::unique_ptr<DiskManager> disk_mgr;
+        std::unique_ptr<BufferPoolManager> buf_pool;
+        page_id_t last_page_id = INVALID_PAGE_ID;
     };
 
     struct Condition {

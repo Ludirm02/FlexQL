@@ -409,6 +409,8 @@ int main(int argc, char** argv) {
         }
         engine.load_from_disk();
         std::cout << "Disk storage loaded.\n";
+        // Truncate WAL after successful disk load to prevent duplicate replay
+        std::ofstream(wal_path, std::ios::trunc | std::ios::binary);
     }
 
     // WAL: replay crash recovery tail then truncate
