@@ -61,13 +61,9 @@ private:
         std::unordered_map<std::string, std::size_t> column_index;
         mutable std::shared_mutex mutex;
         int primary_key_col = -1;
-        std::unordered_map<std::string, std::size_t> primary_index;
+        std::unordered_map<std::string, uint64_t> primary_index;
         RobinHoodIndex pk_robin_index;
         bool pk_is_int = false;
-        std::vector<std::vector<double>> numeric_column_values;
-        std::vector<std::vector<std::uint8_t>> numeric_column_valid;
-        std::vector<std::int64_t> expiry_flat;   // parallel to rows[], for SIMD scan
-        std::vector<Row> rows;
         std::uint64_t version = 1;
         std::unique_ptr<DiskManager> disk_mgr;
         std::unique_ptr<BufferPoolManager> buf_pool;
@@ -142,6 +138,33 @@ private:
 
     bool execute_delete(const std::string& sql, std::string& error);
 
+    static bool row_alive(const PageRow& row, std::int64_t now_ts);
+
+    std::string cell_value_string(const Table& table,
+                                  const PageRow& row,
+                                  std::size_t col_idx) const;
+
+    bool validate_typed_value(const Column& col,
+                              std::string& value,
+                              std::string& error,
+                              double* numeric_out,
+                              bool* numeric_valid) const;
+
+    bool evaluate_where(const Table& table,
+                        const PageRow& row,
+                        const Condition& condition,
+                        std::string* error) const;
+
+    bool evaluate_where_join(const Table& left,
+                             const PageRow& left_row,
+                             const Table& right,
+                             const PageRow& right_row,
+                             const Condition& condition,
+                             std::string* error) const;
+
+    std::unordered_map<std::string, std::uint64_t>
+    capture_versions(const std::vector<std::string>& table_names) const;
+
     bool parse_create_table(const std::string& sql,
                             std::string& table_name,
                             std::vector<Column>& columns,
@@ -153,23 +176,6 @@ private:
                       std::vector<std::int64_t>& expires_at,
                       std::string& error) const;
     bool parse_select(const std::string& sql, SelectPlan& plan, std::string& error) const;
-
-    bool evaluate_where(const Table& table,
-                        const Row& row,
-                        std::size_t row_idx,
-                        const Condition& condition,
-                        std::string* error) const;
-    bool evaluate_where_join(const Table& left,
-                             const Row& left_row,
-                             std::size_t left_row_idx,
-                             const Table& right,
-                             const Row& right_row,
-                             std::size_t right_row_idx,
-                             const Condition& condition,
-                             std::string* error) const;
-
-    std::unordered_map<std::string, std::uint64_t>
-    capture_versions(const std::vector<std::string>& table_names) const;
 
     static std::string trim(const std::string& s);
     static std::string to_upper(std::string s);

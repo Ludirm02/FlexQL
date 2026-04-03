@@ -61,7 +61,7 @@ target_link_libraries(flexql_smoke_test PRIVATE flexql_client)
 target_compile_options(flexql_smoke_test PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(flexql_benchmark
-    tests/benchmark_client.cpp
+    tests/benchmark_flexql.cpp
 )
 
 target_link_libraries(flexql_benchmark PRIVATE flexql_client)

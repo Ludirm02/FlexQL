@@ -60,6 +60,8 @@ public:
             advance_page();
         }
     }
+    page_id_t current_page() const { return cur_frame_ ? cur_frame_->page_id : INVALID_PAGE_ID; }
+    uint16_t current_slot() const { return static_cast<uint16_t>(row_idx_); }
 private:
     void advance_page() {
         rows_in_page_.clear(); row_idx_ = 0;

@@ -404,191 +404,80 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
         return false;
     }
 
-    auto reserve_numeric_aux = [&](std::size_t target) {
-        for (std::size_t i = 0; i < table.columns.size(); ++i) {
-            if (table.columns[i].type != DataType::kInt &&
-                table.columns[i].type != DataType::kDecimal &&
-                table.columns[i].type != DataType::kDatetime) {
-                continue;
-            }
-
-            if (table.numeric_column_values[i].capacity() < target) {
-                table.numeric_column_values[i].reserve(target);
-            }
-            if (table.numeric_column_valid[i].capacity() < target) {
-                table.numeric_column_valid[i].reserve(target);
-            }
-        }
-    };
-
-    if (table.rows.empty() && rows_values.size() >= 512) {
-        std::size_t bulk_target = rows_values.size() * 4096;
-        if (bulk_target < 1'000'000) {
-            bulk_target = 1'000'000;
-        }
-        if (bulk_target > 12'000'000) {
-            bulk_target = 12'000'000;
-        }
-        if (table.rows.capacity() < bulk_target) {
-            table.rows.reserve(bulk_target);
-            table.expiry_flat.reserve(bulk_target);
-            reserve_numeric_aux(bulk_target);
-            if (table.primary_key_col >= 0) {
-                if (table.pk_is_int) {
-                    table.pk_robin_index.reserve(bulk_target);
-                } else {
-                    table.primary_index.reserve(static_cast<std::size_t>(bulk_target / 0.70));
-                }
-            }
-        }
-    }
-
-    const std::size_t needed_rows_capacity = table.rows.size() + rows_values.size();
-    if (table.rows.capacity() < needed_rows_capacity) {
-        std::size_t new_capacity = std::max<std::size_t>(1024, table.rows.capacity() * 2);
-        while (new_capacity < needed_rows_capacity) {
-            new_capacity *= 2;
-        }
-        table.rows.reserve(new_capacity);
-        table.expiry_flat.reserve(new_capacity);
-        reserve_numeric_aux(new_capacity);
-    }
-
-    if (table.primary_key_col >= 0) {
-        if (!table.pk_is_int) {
-            const std::size_t cur_size = table.primary_index.size();
-            const std::size_t buckets = table.primary_index.bucket_count();
-            const std::size_t projected = cur_size + rows_values.size();
-            if (buckets == 0 || projected > static_cast<std::size_t>(static_cast<double>(buckets) * 0.70)) {
-                std::size_t target = std::max<std::size_t>(1024, buckets == 0 ? projected * 2 : buckets * 2);
-                if (target < projected * 2) target = projected * 2;
-                table.primary_index.reserve(target);
-            }
-        }
-    }
-
-    std::vector<double> parsed_numeric(table.columns.size(), 0.0);
-    std::vector<std::uint8_t> parsed_numeric_valid(table.columns.size(), 0U);
-
     const std::int64_t now_ts = now_unix();
-    std::vector<std::vector<std::string>> disk_rows_for_disk;
-    disk_rows_for_disk.reserve(rows_values.size());
     for (std::size_t r = 0; r < rows_values.size(); ++r) {
-        Row row;
-        row.values = std::move(rows_values[r]);
-        row.expires_at_unix = expires_at[r];
-        std::string pk_key;
+        std::vector<std::string>& row_vals = rows_values[r];
+        std::int64_t expires = expires_at[r];
 
-        if (row.values.size() != table.columns.size()) {
+        if (row_vals.size() != table.columns.size()) {
             error = "column count mismatch in INSERT";
             return false;
         }
 
-        std::fill(parsed_numeric_valid.begin(), parsed_numeric_valid.end(), 0U);
-        for (std::size_t i = 0; i < row.values.size(); ++i) {
+        for (std::size_t i = 0; i < row_vals.size(); ++i) {
             double parsed = 0.0;
             bool numeric_valid = false;
-            if (!validate_typed_value(table.columns[i], row.values[i], error, &parsed, &numeric_valid)) {
+            if (!validate_typed_value(table.columns[i], row_vals[i], error, &parsed, &numeric_valid)) {
                 return false;
-            }
-            if (numeric_valid) {
-                parsed_numeric[i] = parsed;
-                parsed_numeric_valid[i] = 1U;
             }
         }
 
         std::int64_t pk_int_val = 0;
+        std::string pk_key;
         if (table.primary_key_col >= 0) {
-            pk_key = row.values[static_cast<std::size_t>(table.primary_key_col)];
+            pk_key = row_vals[static_cast<std::size_t>(table.primary_key_col)];
             if (table.pk_is_int) {
                 fast_parse_int64(pk_key, pk_int_val);
                 auto existing = table.pk_robin_index.lookup(pk_int_val);
-                if (existing != RobinHoodIndex::kEmpty && existing < table.rows.size()
-                    && row_alive(table.rows[existing], now_ts)) {
+                // In true disk-based design, if it exists in the index, it's a duplicate.
+                if (existing != RobinHoodIndex::kEmpty) {
                     error = "duplicate primary key value: " + pk_key;
                     return false;
                 }
             } else {
                 auto idx_it = table.primary_index.find(pk_key);
                 if (idx_it != table.primary_index.end()) {
-                    std::size_t row_idx = idx_it->second;
-                    if (row_idx < table.rows.size() && row_alive(table.rows[row_idx], now_ts)) {
-                        error = "duplicate primary key value: " + pk_key;
-                        return false;
-                    }
+                    error = "duplicate primary key value: " + pk_key;
+                    return false;
                 }
             }
         }
 
-        // DISK: capture original values before clearing for numeric cols
-        std::vector<std::string> disk_values = row.values;
-        for (std::size_t i = 0; i < table.columns.size(); ++i) {
-            if (parsed_numeric_valid[i] == 0U) continue;
-            if (table.columns[i].type != DataType::kInt && table.columns[i].type != DataType::kDecimal) continue;
-            row.values[i].clear();
-        }
-        disk_rows_for_disk.push_back(std::move(disk_values));
-        table.rows.push_back(std::move(row));
-        table.expiry_flat.push_back(table.rows.back().expires_at_unix);
-        const std::size_t row_idx = table.rows.size() - 1;
-
-        if (table.primary_key_col >= 0) {
-            if (table.pk_is_int) {
-                table.pk_robin_index.insert(pk_int_val, row_idx);
-            } else {
-                table.primary_index[pk_key] = row_idx;
+        if (table.buf_pool && table.disk_mgr) {
+            std::string serialized = serialize_row(row_vals, expires);
+            int slot = -1;
+            if (table.last_page_id != INVALID_PAGE_ID) {
+                Frame* f = table.buf_pool->pin(table.last_page_id);
+                if (f) {
+                    slot = f->page.append(serialized.data(), static_cast<uint16_t>(serialized.size()));
+                    table.buf_pool->unpin(table.last_page_id, true);
+                }
             }
-        }
-
-        for (std::size_t i = 0; i < table.columns.size(); ++i) {
-            if (table.columns[i].type != DataType::kInt &&
-                table.columns[i].type != DataType::kDecimal &&
-                table.columns[i].type != DataType::kDatetime) {
-                continue;
+            if (slot < 0) {
+                page_id_t new_pid;
+                Frame* f = table.buf_pool->new_page(new_pid);
+                if (f) {
+                    slot = f->page.append(serialized.data(), static_cast<uint16_t>(serialized.size()));
+                    table.buf_pool->unpin(new_pid, true);
+                    table.last_page_id = new_pid;
+                } else {
+                    error = "failed to allocate new page in buffer pool";
+                    return false;
+                }
             }
 
-            table.numeric_column_values[i].push_back(parsed_numeric[i]);
-            table.numeric_column_valid[i].push_back(parsed_numeric_valid[i]);
+            if (table.primary_key_col >= 0) {
+                uint64_t loc = (static_cast<uint64_t>(table.last_page_id) << 16) | static_cast<uint16_t>(slot);
+                if (table.pk_is_int) {
+                    table.pk_robin_index.insert(pk_int_val, loc);
+                } else {
+                    table.primary_index[pk_key] = loc;
+                }
+            }
         }
     }
 
     ++table.version;
-    // Persist rows to disk (.bin heap file) via async writer
-    if (!skip_disk_write_) {
-        DiskStore::append_rows(table_name, disk_rows_for_disk, expires_at);
-        // Buffer pool: write rows to 8KB pages
-        if (table.buf_pool && table.disk_mgr) {
-            for (std::size_t r = 0; r < disk_rows_for_disk.size(); ++r) {
-                std::string serialized = serialize_row(
-                    disk_rows_for_disk[r],
-                    r < expires_at.size() ? expires_at[r] : 0);
-                bool written = false;
-                // Try last page first
-                if (table.last_page_id != INVALID_PAGE_ID) {
-                    Frame* f = table.buf_pool->pin(table.last_page_id);
-                    if (f) {
-                        if (f->page.append(serialized.data(),
-                            static_cast<uint16_t>(serialized.size())) >= 0) {
-                            table.buf_pool->unpin(table.last_page_id, true);
-                            written = true;
-                        } else {
-                            table.buf_pool->unpin(table.last_page_id, false);
-                        }
-                    }
-                }
-                if (!written) {
-                    page_id_t new_pid;
-                    Frame* f = table.buf_pool->new_page(new_pid);
-                    if (f) {
-                        f->page.append(serialized.data(),
-                            static_cast<uint16_t>(serialized.size()));
-                        table.buf_pool->unpin(new_pid, true);
-                        table.last_page_id = new_pid;
-                    }
-                }
-            }
-        }
-    }
     return true;
 }
 
@@ -1954,11 +1843,25 @@ bool SqlEngine::parse_select(const std::string& sql, SelectPlan& plan, std::stri
     return true;
 }
 
-bool SqlEngine::evaluate_where(const Table& table,
-                               const Row& /*row*/,
-                               std::size_t row_idx,
-                               const Condition& condition,
-                               std::string* error) const {
+bool SqlEngine::evaluate_where(const Table& table, const PageRow& row, const Condition& condition, std::string* error) const {
+    if (!condition.present) return true;
+    std::string cond_table, cond_col;
+    split_qualified(condition.column, cond_table, cond_col);
+    std::string raw_col = cond_col.empty() ? condition.column : cond_col;
+    if (!cond_table.empty() && cond_table != table.name) { if (error) *error = "WHERE references unknown table: " + cond_table; return false; }
+    std::size_t idx = 0; std::string lookup_error;
+    const Column* col = lookup_column(table, raw_col, idx, lookup_error);
+    if (!col) { if (error) *error = lookup_error; return false; }
+    bool result = false;
+    const std::string rhs = unquote_literal(condition.value);
+    std::string cmp_error;
+    if (!compare_values(cell_value_string(table, row, idx), rhs, col->type, condition.op, result, cmp_error)) {
+        if (error) *error = cmp_error; return false;
+    }
+    return result;
+}
+
+bool SqlEngine::evaluate_where_join
     if (!condition.present) {
         return true;
     }
@@ -2011,14 +1914,34 @@ bool SqlEngine::evaluate_where(const Table& table,
     return result;
 }
 
-bool SqlEngine::evaluate_where_join(const Table& left,
-                                    const Row& /*left_row*/,
-                                    std::size_t left_row_idx,
-                                    const Table& right,
-                                    const Row& /*right_row*/,
-                                    std::size_t right_row_idx,
-                                    const Condition& condition,
-                                    std::string* error) const {
+bool SqlEngine::evaluate_where_join(const Table& left, const PageRow& left_row, const Table& right, const PageRow& right_row, const Condition& condition, std::string* error) const {
+    if (!condition.present) return true;
+    std::string cond_table, cond_col;
+    split_qualified(condition.column, cond_table, cond_col);
+    std::string raw_col = cond_col.empty() ? condition.column : cond_col;
+    const Table* table = nullptr; const PageRow* row_ptr = nullptr;
+    if (cond_table.empty()) {
+        std::size_t dummy; std::string e1, e2;
+        bool in_l = lookup_column(left, raw_col, dummy, e1) != nullptr;
+        bool in_r = lookup_column(right, raw_col, dummy, e2) != nullptr;
+        if (in_l && in_r) { if (error) *error = "ambiguous column"; return false; }
+        if (!in_l && !in_r) { if (error) *error = "unknown column"; return false; }
+        table = in_l ? &left : &right; row_ptr = in_l ? &left_row : &right_row;
+    } else if (cond_table == left.name) { table = &left; row_ptr = &left_row;
+    } else if (cond_table == right.name) { table = &right; row_ptr = &right_row;
+    } else { if (error) *error = "unknown table"; return false; }
+    
+    std::size_t idx = 0; std::string lookup_error;
+    const Column* col = lookup_column(*table, raw_col, idx, lookup_error);
+    if (!col) { if (error) *error = lookup_error; return false; }
+    bool result = false; std::string cmp_error;
+    if (!compare_values(cell_value_string(*table, *row_ptr, idx), unquote_literal(condition.value), col->type, condition.op, result, cmp_error)) {
+        if (error) *error = cmp_error; return false;
+    }
+    return result;
+}
+
+std::unordered_map<std::string, std::uint64_t>
     if (!condition.present) {
         return true;
     }
@@ -2576,8 +2499,8 @@ std::size_t SqlEngine::find_keyword(const std::string& sql_upper,
     return std::string::npos;
 }
 
-bool SqlEngine::row_alive(const Row& row, std::int64_t now_ts) {
-    return row.expires_at_unix == 0 || row.expires_at_unix > now_ts;
+bool SqlEngine::row_alive(const PageRow& row, std::int64_t now_ts) {
+    return row.expires_at == 0 || row.expires_at > now_ts;
 }
 
 bool SqlEngine::row_numeric_value(const Table& table,
@@ -2596,9 +2519,12 @@ bool SqlEngine::row_numeric_value(const Table& table,
     return true;
 }
 
-std::string SqlEngine::cell_value_string(const Table& table,
-                                         std::size_t row_idx,
-                                         std::size_t col_idx) const {
+std::string SqlEngine::cell_value_string(const Table& table, const PageRow& row, std::size_t col_idx) const {
+    if (col_idx >= table.columns.size() || col_idx >= row.values.size()) return {};
+    return row.values[col_idx];
+}
+
+bool SqlEngine::validate_typed_value
     if (row_idx >= table.rows.size() || col_idx >= table.columns.size()) return {};
     const Row& row = table.rows[row_idx];
     if (col_idx >= row.values.size()) return {};
@@ -2714,12 +2640,16 @@ bool SqlEngine::execute_delete(const std::string& sql, std::string& error) {
         return false;
     }
     Table& table = it->second;
-    table.rows.clear();
-    table.expiry_flat.clear();
     table.primary_index.clear();
     table.pk_robin_index = RobinHoodIndex(1024);
-    for (auto& vec : table.numeric_column_values) vec.clear();
-    for (auto& vec : table.numeric_column_valid) vec.clear();
+    if (table.disk_mgr) {
+        // Since we are resetting the table, the easiest way is to create a new disk manager / buffer pool
+        table.buf_pool->flush_all();
+        std::filesystem::remove("data/pages/" + table.name + ".db");
+        table.disk_mgr = std::make_unique<DiskManager>(table.name);
+        table.buf_pool = std::make_unique<BufferPoolManager>(*table.disk_mgr);
+        table.last_page_id = INVALID_PAGE_ID;
+    }
     ++table.version;
     return true;
 }
@@ -2728,68 +2658,28 @@ bool SqlEngine::execute_delete(const std::string& sql, std::string& error) {
 void flexql::SqlEngine::load_from_disk() {
     std::unique_lock<std::shared_mutex> lock(db_mutex_);
     for (auto& [name, table] : tables_) {
-        // Try loading from buffer pool .db pages first (faster aligned reads)
-        // Fall back to .bin file if .db doesn't exist
-        std::vector<DiskRow> disk_rows;
-        bool loaded_from_pages = false;
-        if (table.buf_pool && table.disk_mgr && table.disk_mgr->num_pages() > 0) {
-            TableIterator it(*table.buf_pool, table.disk_mgr->num_pages());
+        if (!table.buf_pool || !table.disk_mgr) continue;
+        page_id_t num_pages = table.disk_mgr->num_pages();
+        if (num_pages > 0) {
+            table.last_page_id = num_pages - 1;
+            TableIterator it(*table.buf_pool, num_pages);
             while (it.valid()) {
-                const PageRow& pr = it.current();
-                DiskRow dr;
-                dr.values = pr.values;
-                dr.expires_at = pr.expires_at;
-                disk_rows.push_back(std::move(dr));
+                if (table.primary_key_col >= 0) {
+                    const PageRow& pr = it.current();
+                    if (static_cast<size_t>(table.primary_key_col) < pr.values.size()) {
+                        const std::string& pkval = pr.values[table.primary_key_col];
+                        uint64_t loc = (static_cast<uint64_t>(it.current_page()) << 16) | it.current_slot();
+                        if (table.pk_is_int) {
+                            int64_t pk = 0;
+                            fast_parse_int64(pkval, pk);
+                            table.pk_robin_index.insert(pk, loc);
+                        } else {
+                            table.primary_index[pkval] = loc;
+                        }
+                    }
+                }
                 it.next();
             }
-            loaded_from_pages = !disk_rows.empty();
-        }
-        if (!loaded_from_pages) {
-            disk_rows = DiskStore::load_rows(name);
-        }
-        if (disk_rows.empty()) continue;
-        table.rows.reserve(disk_rows.size());
-        table.expiry_flat.reserve(disk_rows.size());
-        for (size_t i = 0; i < table.columns.size(); ++i) {
-            if (table.columns[i].type == DataType::kInt ||
-                table.columns[i].type == DataType::kDecimal ||
-                table.columns[i].type == DataType::kDatetime) {
-                table.numeric_column_values[i].reserve(disk_rows.size());
-                table.numeric_column_valid[i].reserve(disk_rows.size());
-            }
-        }
-        for (auto& dr : disk_rows) {
-            if (dr.values.size() != table.columns.size()) continue;
-            Row row;
-            row.expires_at_unix = dr.expires_at;
-            row.values = dr.values;
-            std::string err;
-            for (size_t i = 0; i < table.columns.size(); ++i) {
-                double parsed = 0.0; bool nvalid = false;
-                validate_typed_value(table.columns[i], row.values[i], err, &parsed, &nvalid);
-                if (table.columns[i].type == DataType::kInt ||
-                    table.columns[i].type == DataType::kDecimal ||
-                    table.columns[i].type == DataType::kDatetime) {
-                    table.numeric_column_values[i].push_back(nvalid ? parsed : 0.0);
-                    table.numeric_column_valid[i].push_back(nvalid ? 1 : 0);
-                    if (nvalid && (table.columns[i].type == DataType::kInt ||
-                                  table.columns[i].type == DataType::kDecimal))
-                        row.values[i].clear();
-                }
-            }
-            size_t ridx = table.rows.size();
-            if (table.primary_key_col >= 0) {
-                const std::string& pkval = dr.values[table.primary_key_col];
-                if (table.pk_is_int) {
-                    int64_t pk = 0;
-                    fast_parse_int64(pkval, pk);
-                    table.pk_robin_index.insert(pk, ridx);
-                } else {
-                    table.primary_index[pkval] = ridx;
-                }
-            }
-            table.expiry_flat.push_back(row.expires_at_unix);
-            table.rows.push_back(std::move(row));
         }
         ++table.version;
     }
@@ -2799,21 +2689,8 @@ void flexql::SqlEngine::checkpoint_to_disk() {
     std::shared_lock<std::shared_mutex> lock(db_mutex_);
     for (auto& [name, table] : tables_) {
         std::shared_lock<std::shared_mutex> tlock(table.mutex);
-        DiskStore::truncate_data(name);
-        if (table.rows.empty()) continue;
-        std::vector<std::vector<std::string>> rows;
-        std::vector<std::int64_t> expires;
-        rows.reserve(table.rows.size());
-        expires.reserve(table.rows.size());
-        for (std::size_t i = 0; i < table.rows.size(); ++i) {
-            std::vector<std::string> row_vals;
-            row_vals.reserve(table.columns.size());
-            for (std::size_t j = 0; j < table.columns.size(); ++j) {
-                row_vals.push_back(cell_value_string(table, i, j));
-            }
-            rows.push_back(std::move(row_vals));
-            expires.push_back(table.rows[i].expires_at_unix);
+        if (table.buf_pool) {
+            table.buf_pool->flush_all();
         }
-        DiskStore::write_rows_to_file(name, rows, expires);
     }
 }
