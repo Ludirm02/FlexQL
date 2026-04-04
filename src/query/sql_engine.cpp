@@ -4,7 +4,9 @@
 #include "sql_engine.hpp"
 
 #pragma GCC optimize("O3,unroll-loops")
+#ifdef __AVX2__
 #pragma GCC target("avx2,bmi,bmi2,popcnt")
+#endif
 
 #include <arpa/inet.h>
 #include <algorithm>
@@ -333,18 +335,20 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
     }
 
     if (tables_.count(table_name) != 0U) {
-    // Clear existing data so re-creation acts as reset
-    Table& existing = tables_[table_name];
-    existing.rows.clear();
-    existing.expiry_flat.clear();
-    existing.primary_index.clear();
-    existing.pk_robin_index = RobinHoodIndex(1024);
-    for (auto& vec : existing.numeric_column_values) vec.clear();
-    for (auto& vec : existing.numeric_column_valid) vec.clear();
-    ++existing.version;
-    DiskStore::truncate_data(table_name);
-    return true;
-}
+        // Clear existing data so re-creation acts as reset
+        Table& existing = tables_[table_name];
+        existing.primary_index.clear();
+        existing.pk_robin_index = RobinHoodIndex(1024);
+        ++existing.version;
+        if (existing.buf_pool) { existing.buf_pool->flush_all(); }
+        std::filesystem::remove("data/pages/" + table_name + ".db");
+        if (existing.disk_mgr) {
+            existing.disk_mgr = std::make_unique<DiskManager>(table_name);
+            existing.buf_pool = std::make_unique<BufferPoolManager>(*existing.disk_mgr);
+            existing.last_page_id = INVALID_PAGE_ID;
+        }
+        return true;
+    }
 
     auto [table_it, inserted] = tables_.try_emplace(table_name);
     if (!inserted) {
@@ -358,8 +362,6 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
     t.disk_mgr = std::make_unique<DiskManager>(table_name);
     t.buf_pool = std::make_unique<BufferPoolManager>(*t.disk_mgr, 32768);
 
-    t.numeric_column_values.resize(t.columns.size());
-    t.numeric_column_valid.resize(t.columns.size());
     if (primary_col >= 0) {
         if (columns[static_cast<std::size_t>(primary_col)].type == DataType::kInt) {
             t.pk_is_int = true;
@@ -371,11 +373,6 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
 
     for (std::size_t i = 0; i < t.columns.size(); ++i) {
         t.column_index[t.columns[i].name] = i;
-        if (t.columns[i].type == DataType::kInt || t.columns[i].type == DataType::kDecimal ||
-            t.columns[i].type == DataType::kDatetime) {
-            t.numeric_column_values[i].reserve(1024);
-            t.numeric_column_valid[i].reserve(1024);
-        }
     }
 
     DiskStore::write_schema(table_name, sql);
@@ -404,12 +401,15 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
         return false;
     }
 
-    const std::int64_t now_ts = now_unix();
+    Frame* current_frame = nullptr;
+    page_id_t current_pid = INVALID_PAGE_ID;
+
     for (std::size_t r = 0; r < rows_values.size(); ++r) {
         std::vector<std::string>& row_vals = rows_values[r];
         std::int64_t expires = expires_at[r];
 
         if (row_vals.size() != table.columns.size()) {
+            if (current_frame) table.buf_pool->unpin(current_pid, true);
             error = "column count mismatch in INSERT";
             return false;
         }
@@ -418,6 +418,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             double parsed = 0.0;
             bool numeric_valid = false;
             if (!validate_typed_value(table.columns[i], row_vals[i], error, &parsed, &numeric_valid)) {
+                if (current_frame) table.buf_pool->unpin(current_pid, true);
                 return false;
             }
         }
@@ -429,14 +430,15 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             if (table.pk_is_int) {
                 fast_parse_int64(pk_key, pk_int_val);
                 auto existing = table.pk_robin_index.lookup(pk_int_val);
-                // In true disk-based design, if it exists in the index, it's a duplicate.
                 if (existing != RobinHoodIndex::kEmpty) {
+                    if (current_frame) table.buf_pool->unpin(current_pid, true);
                     error = "duplicate primary key value: " + pk_key;
                     return false;
                 }
             } else {
                 auto idx_it = table.primary_index.find(pk_key);
                 if (idx_it != table.primary_index.end()) {
+                    if (current_frame) table.buf_pool->unpin(current_pid, true);
                     error = "duplicate primary key value: " + pk_key;
                     return false;
                 }
@@ -446,19 +448,20 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
         if (table.buf_pool && table.disk_mgr) {
             std::string serialized = serialize_row(row_vals, expires);
             int slot = -1;
-            if (table.last_page_id != INVALID_PAGE_ID) {
-                Frame* f = table.buf_pool->pin(table.last_page_id);
-                if (f) {
-                    slot = f->page.append(serialized.data(), static_cast<uint16_t>(serialized.size()));
-                    table.buf_pool->unpin(table.last_page_id, true);
-                }
+            if (current_frame == nullptr && table.last_page_id != INVALID_PAGE_ID) {
+                current_pid = table.last_page_id;
+                current_frame = table.buf_pool->pin(current_pid);
+            }
+            if (current_frame) {
+                slot = current_frame->page.append(serialized.data(), static_cast<uint16_t>(serialized.size()));
             }
             if (slot < 0) {
+                if (current_frame) table.buf_pool->unpin(current_pid, true);
                 page_id_t new_pid;
-                Frame* f = table.buf_pool->new_page(new_pid);
-                if (f) {
-                    slot = f->page.append(serialized.data(), static_cast<uint16_t>(serialized.size()));
-                    table.buf_pool->unpin(new_pid, true);
+                current_frame = table.buf_pool->new_page(new_pid);
+                if (current_frame) {
+                    current_pid = new_pid;
+                    slot = current_frame->page.append(serialized.data(), static_cast<uint16_t>(serialized.size()));
                     table.last_page_id = new_pid;
                 } else {
                     error = "failed to allocate new page in buffer pool";
@@ -467,7 +470,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             }
 
             if (table.primary_key_col >= 0) {
-                uint64_t loc = (static_cast<uint64_t>(table.last_page_id) << 16) | static_cast<uint16_t>(slot);
+                uint64_t loc = (static_cast<uint64_t>(current_pid) << 16) | static_cast<uint16_t>(slot);
                 if (table.pk_is_int) {
                     table.pk_robin_index.insert(pk_int_val, loc);
                 } else {
@@ -476,9 +479,33 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             }
         }
     }
+    if (current_frame) table.buf_pool->unpin(current_pid, true);
 
+    // NOTE: We do NOT flush or fsync here. The buffer pool's LRU
+    // eviction writes dirty pages to disk automatically when frames
+    // are needed. A full checkpoint (flush+fsync per table) happens
+    // only at clean shutdown via checkpoint_to_disk(). This design
+    // maximises insert throughput while keeping data on disk via
+    // the OS page cache (survives most crashes).
     ++table.version;
     return true;
+}
+
+
+static PageRow fetch_row_from_buf(BufferPoolManager* bpm, uint64_t loc) {
+    page_id_t pid = loc >> 16;
+    uint16_t slot = loc & 0xFFFF;
+    Frame* f = bpm->pin(pid);
+    PageRow pr;
+    if (f) {
+        const char* pdata = f->page.data;
+        uint16_t slot_len = 0;
+        std::memcpy(&slot_len, pdata + slot, sizeof(slot_len));
+        std::size_t inner = 0;
+        deserialize_row(pdata + slot + sizeof(slot_len), slot_len, inner, pr);
+        bpm->unpin(pid, false);
+    }
+    return pr;
 }
 
 bool SqlEngine::execute_select(const std::string& sql,
@@ -487,26 +514,18 @@ bool SqlEngine::execute_select(const std::string& sql,
                                std::string* cached_wire_out,
                                bool binary_wire) {
     SelectPlan plan;
-    if (!parse_select(sql, plan, error)) {
-        return false;
-    }
+    if (!parse_select(sql, plan, error)) return false;
 
     const std::int64_t now_ts = now_unix();
 
     std::shared_lock<std::shared_mutex> lock(db_mutex_);
     auto base_it = tables_.find(plan.base_table);
-    if (base_it == tables_.end()) {
-        error = "unknown table: " + plan.base_table;
-        return false;
-    }
-
+    if (base_it == tables_.end()) { error = "unknown table: " + plan.base_table; return false; }
     const Table& base = base_it->second;
+
     bool skip_cache = false;
     if (!plan.has_join && plan.where.present && plan.where.op == "=" && base.primary_key_col >= 0) {
-        const std::string& pk_name = base.columns[static_cast<std::size_t>(base.primary_key_col)].name;
-        if (plan.where.column == pk_name || plan.where.column == (base.name + "." + pk_name)) {
-            skip_cache = true;
-        }
+        skip_cache = true;
     }
 
     std::string cache_key;
@@ -515,711 +534,214 @@ bool SqlEngine::execute_select(const std::string& sql,
         cache_key = normalize_sql_for_cache(sql);
         versions = capture_versions(plan.touched_tables);
         QueryResult* cache_out = &out;
-        if (cache_.get(cache_key, versions, cache_out, cached_wire_out, binary_wire)) {
-            return true;
-        }
+        if (cache_.get(cache_key, versions, cache_out, cached_wire_out, binary_wire)) return true;
     }
 
-    if (!plan.has_join) {
-        std::shared_lock<std::shared_mutex> base_table_lock(base.mutex);
-        std::vector<std::size_t> selected_indexes;
-        if (plan.select_star) {
-            for (std::size_t i = 0; i < base.columns.size(); ++i) {
-                out.columns.push_back(base.columns[i].name);
-                selected_indexes.push_back(i);
-            }
-        } else {
-            for (const std::string& c : plan.select_columns) {
-                std::string ref_table;
-                std::string ref_col;
-                if (split_qualified(c, ref_table, ref_col) && !ref_table.empty() && ref_table != base.name) {
-                    error = "column references unknown table: " + c;
-                    return false;
-                }
-                std::size_t idx = 0;
-                std::string lookup_error;
-                if (lookup_column(base, ref_col.empty() ? c : ref_col, idx, lookup_error) == nullptr) {
-                    error = lookup_error;
-                    return false;
-                }
-                out.columns.push_back(base.columns[idx].name);
-                selected_indexes.push_back(idx);
-            }
-        }
-
-        struct WhereMeta {
-            bool enabled = false;
-            std::size_t idx = 0;
-            DataType type = DataType::kVarchar;
-            std::string op;
-            char op0 = '\0';
-            char op1 = '\0';
-            std::string rhs_unquoted;
-            bool rhs_numeric_valid = false;
-            double rhs_numeric = 0.0;
-        } where_meta;
-
-        if (plan.where.present) {
-            std::string cond_table;
-            std::string cond_col;
-            split_qualified(plan.where.column, cond_table, cond_col);
-            std::string raw_col = cond_col.empty() ? plan.where.column : cond_col;
-            if (!cond_table.empty() && cond_table != base.name) {
-                error = "WHERE references unknown table: " + cond_table;
-                return false;
-            }
-
-            std::string lookup_error;
-            const Column* col = lookup_column(base, raw_col, where_meta.idx, lookup_error);
-            if (col == nullptr) {
-                error = lookup_error;
-                return false;
-            }
-
-            where_meta.enabled = true;
-            where_meta.type = col->type;
-            where_meta.op = plan.where.op;
-            where_meta.op0 = plan.where.op[0];
-            where_meta.op1 = plan.where.op.size() > 1 ? plan.where.op[1] : '\0';
-            where_meta.rhs_unquoted = unquote_literal(plan.where.value);
-            where_meta.rhs_numeric_valid = parse_numeric_literal(where_meta.rhs_unquoted, where_meta.type,
-                                                                 where_meta.rhs_numeric);
-        }
-
-        if (!where_meta.enabled) {
-            out.rows.reserve(base.rows.size());
-        } else if (where_meta.op == "=") {
-            if (base.primary_key_col >= 0 && where_meta.idx == static_cast<std::size_t>(base.primary_key_col)) {
-                out.rows.reserve(1);
-            } else {
-                out.rows.reserve(std::max<std::size_t>(128, base.rows.size() / 64));
-            }
-        } else if (where_meta.op == "!=") {
-            out.rows.reserve(base.rows.size());
-        } else {
-            out.rows.reserve(std::max<std::size_t>(1024, base.rows.size() / 2));
-        }
-
-        const std::size_t proj_count = selected_indexes.size();
-
-        auto emit_projected_row = [&](std::size_t row_idx) {
-            std::vector<std::string> projected;
-            projected.reserve(proj_count);
-            for (std::size_t i = 0; i < proj_count; ++i) {
-                projected.push_back(cell_value_string(base, row_idx, selected_indexes[i]));
-            }
-            out.rows.push_back(std::move(projected));
-        };
-
-        auto fast_numeric_value = [&](std::size_t row_idx, std::size_t col_idx, double& out_num) -> bool {
-            if (col_idx >= base.numeric_column_valid.size() || col_idx >= base.numeric_column_values.size()) {
-                return false;
-            }
-            const auto& valid = base.numeric_column_valid[col_idx];
-            const auto& values = base.numeric_column_values[col_idx];
-            if (row_idx >= valid.size() || row_idx >= values.size() || valid[row_idx] == 0U) {
-                return false;
-            }
-            out_num = values[row_idx];
-            return true;
-        };
-
-        auto passes_where = [&](std::size_t row_idx, bool& pass) -> bool {
-            if (!where_meta.enabled) {
-                pass = true;
-                return true;
-            }
-
-            double lhs_numeric = 0.0;
-            if (where_meta.rhs_numeric_valid &&
-                fast_numeric_value(row_idx, where_meta.idx, lhs_numeric) &&
-                (where_meta.type == DataType::kInt || where_meta.type == DataType::kDecimal ||
-                 where_meta.type == DataType::kDatetime)) {
-                if (!eval_numeric_op(lhs_numeric, where_meta.rhs_numeric, where_meta.op, pass)) {
-                    error = "unsupported operator in WHERE: " + where_meta.op;
-                    return false;
-                }
-                return true;
-            }
-
-            std::string cmp_error;
-            if (!compare_values(cell_value_string(base, row_idx, where_meta.idx),
-                                where_meta.rhs_unquoted,
-                                where_meta.type,
-                                where_meta.op,
-                                pass, cmp_error)) {
-                error = cmp_error;
-                return false;
-            }
-            return true;
-        };
-
-        auto maybe_pk_index_scan = [&]() -> bool {
-            if (!where_meta.enabled || where_meta.op != "=" || base.primary_key_col < 0) {
-                return false;
-            }
-            if (where_meta.idx != static_cast<std::size_t>(base.primary_key_col)) {
-                return false;
-            }
-
-            if (base.pk_is_int && where_meta.rhs_numeric_valid) {
-                std::int64_t pk_int = static_cast<std::int64_t>(where_meta.rhs_numeric);
-                auto row_idx = base.pk_robin_index.lookup(pk_int);
-                if (row_idx == RobinHoodIndex::kEmpty || row_idx >= base.rows.size()) {
-                    return true;
-                }
-                if (!row_alive(base.rows[row_idx], now_ts)) return true;
-                bool pass = false;
-                if (!passes_where(row_idx, pass)) return true;
-                if (pass) emit_projected_row(row_idx);
-                return true;
-            }
-            const std::string& key = where_meta.rhs_unquoted;
-            auto idx_it = base.primary_index.find(key);
-            if (idx_it == base.primary_index.end() || idx_it->second >= base.rows.size()) {
-                return true;
-            }
-            const std::size_t row_idx = idx_it->second;
-            if (!row_alive(base.rows[row_idx], now_ts)) {
-                return true;
-            }
-            bool pass = false;
-            if (!passes_where(row_idx, pass)) {
-                return true;
-            }
-            if (!pass) {
-                return true;
-            }
-            emit_projected_row(row_idx);
-            return true;
-        };
-
-        auto maybe_numeric_range_scan = [&]() -> bool {
-            if (!where_meta.enabled || !where_meta.rhs_numeric_valid) {
-                return false;
-            }
-            if (where_meta.type != DataType::kInt && where_meta.type != DataType::kDecimal &&
-                where_meta.type != DataType::kDatetime) {
-                return false;
-            }
-            if (where_meta.op == "!=") {
-                return false;
-            }
-            if (where_meta.idx >= base.numeric_column_values.size()) {
-                return false;
-            }
-
-            const auto& col_vals  = base.numeric_column_values[where_meta.idx];
-            const auto& col_valid = base.numeric_column_valid[where_meta.idx];
-            const std::size_t n   = base.rows.size();
-            if (col_vals.empty()) {
-                return true;
-            }
-            out.rows.reserve(std::max<std::size_t>(1024, n / 2));
-
-            const double rhs = where_meta.rhs_numeric;
-            const char op0   = where_meta.op0;
-            const char op1   = where_meta.op1;
-            const std::int64_t* __restrict__ expiry_ptr = base.expiry_flat.data();
-            std::vector<std::size_t> matching_indices;
-            matching_indices.reserve(n / 2);
-
-#pragma omp parallel
-{
-    std::vector<std::size_t> local_matches;
-    #pragma omp for nowait
-    for (std::size_t i = 0; i < n; ++i) {
-        if (col_valid[i] == 0U) continue;
-        if (expiry_ptr[i] != 0 && expiry_ptr[i] <= now_ts) continue;
-        const double lhs = col_vals[i];
-        bool pass;
-        if      (op0 == '=' && op1 == '\0') pass = (lhs == rhs);
-        else if (op0 == '!')                pass = (lhs != rhs);
-        else if (op0 == '>' && op1 == '\0') pass = (lhs >  rhs);
-        else if (op0 == '>' && op1 == '=')  pass = (lhs >= rhs);
-        else if (op0 == '<' && op1 == '\0') pass = (lhs <  rhs);
-        else                                pass = (lhs <= rhs);
-        if (pass) local_matches.push_back(i);
-    }
-    #pragma omp critical
-    matching_indices.insert(matching_indices.end(), local_matches.begin(), local_matches.end());
-}
-
-            std::sort(matching_indices.begin(), matching_indices.end());
-            for (std::size_t i : matching_indices) {
-                emit_projected_row(i);
-            }
-            return true;
-        };
-
-        if (!maybe_pk_index_scan()) {
-            bool used_numeric_index = maybe_numeric_range_scan();
-            if (!error.empty()) {
-                return false;
-            }
-            if (!used_numeric_index) {
-                for (std::size_t row_idx = 0; row_idx < base.rows.size(); ++row_idx) {
-                    if (row_idx < base.expiry_flat.size() && base.expiry_flat[row_idx] != 0 && base.expiry_flat[row_idx] <= now_ts) {
-                        continue;
-                    }
-                    bool pass = false;
-                    if (!passes_where(row_idx, pass)) {
-                        return false;
-                    }
-                    if (!pass) {
-                        continue;
-                    }
-                    emit_projected_row(row_idx);
-                }
-            }
-        }
-
-        if (plan.order_by.present) {
-            std::size_t sort_col_idx = 0;
-            bool found = false;
-            for (std::size_t i = 0; i < out.columns.size(); ++i) {
-                if (out.columns[i] == plan.order_by.column) {
-                    sort_col_idx = i;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                error = "ORDER BY column not in SELECT list: " + plan.order_by.column;
-                return false;
-            }
-            DataType sort_type = DataType::kVarchar;
-            auto col_it = base.column_index.find(plan.order_by.column);
-            if (col_it != base.column_index.end()) {
-                sort_type = base.columns[col_it->second].type;
-            }
-            bool desc = plan.order_by.descending;
-            std::stable_sort(out.rows.begin(), out.rows.end(),
-                [&](const std::vector<std::string>& a, const std::vector<std::string>& b) {
-                    const std::string& av = a[sort_col_idx];
-                    const std::string& bv = b[sort_col_idx];
-                    bool less_than = false;
-                    if (sort_type == DataType::kInt) {
-                        std::int64_t ai = 0, bi = 0;
-                        fast_parse_int64(av, ai);
-                        fast_parse_int64(bv, bi);
-                        less_than = ai < bi;
-                    } else if (sort_type == DataType::kDecimal) {
-                        double ad = 0, bd = 0;
-                        fast_parse_double(av, ad);
-                        fast_parse_double(bv, bd);
-                        less_than = ad < bd;
-                    } else {
-                        less_than = av < bv;
-                    }
-                    return desc ? !less_than : less_than;
-                });
-        }
-
-        if (!skip_cache) {
-            cache_.put(cache_key, out, versions);
-        }
-        return true;
-    }
-
-    auto join_it = tables_.find(plan.join_table);
-    if (join_it == tables_.end()) {
-        error = "unknown table: " + plan.join_table;
-        return false;
-    }
-    const Table& right = join_it->second;
-    std::shared_lock<std::shared_mutex> table_lock_a;
-    std::shared_lock<std::shared_mutex> table_lock_b;
-    if (base.name <= right.name) {
-        table_lock_a = std::shared_lock<std::shared_mutex>(base.mutex);
-        table_lock_b = std::shared_lock<std::shared_mutex>(right.mutex);
-    } else {
-        table_lock_a = std::shared_lock<std::shared_mutex>(right.mutex);
-        table_lock_b = std::shared_lock<std::shared_mutex>(base.mutex);
-    }
-
-    std::string left_join_tbl;
-    std::string left_join_col;
-    if (!split_qualified(plan.join_left, left_join_tbl, left_join_col) || left_join_col.empty()) {
-        error = "invalid join condition, expected table.column = table.column";
-        return false;
-    }
-    std::string right_join_tbl;
-    std::string right_join_col;
-    if (!split_qualified(plan.join_right, right_join_tbl, right_join_col) || right_join_col.empty()) {
-        error = "invalid join condition, expected table.column = table.column";
-        return false;
-    }
-
-    const Table* join_left_table = nullptr;
-    const Table* join_right_table = nullptr;
-
-    if (left_join_tbl == base.name) {
-        join_left_table = &base;
-    } else if (left_join_tbl == right.name) {
-        join_left_table = &right;
-    }
-
-    if (right_join_tbl == base.name) {
-        join_right_table = &base;
-    } else if (right_join_tbl == right.name) {
-        join_right_table = &right;
-    }
-
-    if (join_left_table == nullptr || join_right_table == nullptr || join_left_table == join_right_table) {
-        error = "join columns must reference one column from each table";
-        return false;
-    }
-
-    std::size_t left_join_idx = 0;
-    std::size_t right_join_idx = 0;
-    std::string lookup_error;
-    if (lookup_column(*join_left_table, left_join_col, left_join_idx, lookup_error) == nullptr) {
-        error = lookup_error;
-        return false;
-    }
-    if (lookup_column(*join_right_table, right_join_col, right_join_idx, lookup_error) == nullptr) {
-        error = lookup_error;
-        return false;
-    }
-
-    struct Projection {
-        const Table* table;
-        std::size_t index;
-        std::string output_name;
-    };
+    struct Projection { const Table* table; std::size_t index; std::string output_name; };
     std::vector<Projection> projections;
 
+    const Table* right_ptr = nullptr;
+    if (plan.has_join) {
+        auto r_it = tables_.find(plan.join_table);
+        if (r_it == tables_.end()) { error = "unknown join table: " + plan.join_table; return false; }
+        right_ptr = &r_it->second;
+    }
+    
     if (plan.select_star) {
         for (std::size_t i = 0; i < base.columns.size(); ++i) {
-            projections.push_back({&base, i, base.name + "." + base.columns[i].name});
+            // Use qualified name for JOINs to disambiguate, plain name otherwise
+            const std::string col_out = plan.has_join
+                ? (base.name + "." + base.columns[i].name)
+                : base.columns[i].name;
+            projections.push_back({&base, i, col_out});
         }
-        for (std::size_t i = 0; i < right.columns.size(); ++i) {
-            projections.push_back({&right, i, right.name + "." + right.columns[i].name});
+        if (right_ptr) {
+            for (std::size_t i = 0; i < right_ptr->columns.size(); ++i) {
+                projections.push_back({right_ptr, i, right_ptr->name + "." + right_ptr->columns[i].name});
+            }
         }
     } else {
         for (const std::string& ref : plan.select_columns) {
-            std::string tbl;
-            std::string col;
-            split_qualified(ref, tbl, col);
-
-            auto push_projection = [&](const Table* t, const std::string& c, const std::string& output) {
-                std::size_t idx = 0;
-                std::string err;
-                if (lookup_column(*t, c, idx, err) == nullptr) {
-                    error = err;
-                    return false;
-                }
-                projections.push_back({t, idx, output});
-                return true;
-            };
-
-            if (!tbl.empty()) {
-                if (tbl == base.name) {
-                    if (!push_projection(&base, col, base.name + "." + col)) {
-                        return false;
-                    }
-                } else if (tbl == right.name) {
-                    if (!push_projection(&right, col, right.name + "." + col)) {
-                        return false;
-                    }
-                } else {
-                    error = "unknown table in select list: " + tbl;
-                    return false;
-                }
-                continue;
-            }
-
-            std::size_t base_idx = 0;
-            std::size_t right_idx = 0;
-            std::string err1;
-            std::string err2;
-            bool in_base = lookup_column(base, ref, base_idx, err1) != nullptr;
-            bool in_right = lookup_column(right, ref, right_idx, err2) != nullptr;
-
-            if (in_base && in_right) {
-                error = "ambiguous column in select list: " + ref;
-                return false;
-            }
-            if (!in_base && !in_right) {
-                error = "unknown column in select list: " + ref;
-                return false;
-            }
-
+            std::string tbl, col; split_qualified(ref, tbl, col);
+            std::size_t base_idx, right_idx; std::string err1, err2;
+            bool in_base = lookup_column(base, col.empty() ? ref : col, base_idx, err1) != nullptr;
+            bool in_right = right_ptr && lookup_column(*right_ptr, col.empty() ? ref : col, right_idx, err2) != nullptr;
+            if (in_base && in_right) { error = "ambiguous column"; return false; }
+            if (!in_base && !in_right) { error = "unknown column"; return false; }
             if (in_base) {
-                projections.push_back({&base, base_idx, base.name + "." + ref});
+                // Use qualified name in JOINs, plain name for single-table queries
+                const std::string out_name = plan.has_join ? (base.name + "." + ref) : (col.empty() ? ref : col);
+                projections.push_back({&base, base_idx, out_name});
             } else {
-                projections.push_back({&right, right_idx, right.name + "." + ref});
+                projections.push_back({right_ptr, right_idx, right_ptr->name + "." + ref});
             }
         }
     }
+    for (const auto& p : projections) out.columns.push_back(p.output_name);
 
-    out.columns.reserve(projections.size());
-    for (const Projection& p : projections) {
-        out.columns.push_back(p.output_name);
-    }
+    if (!plan.has_join) {
+        std::shared_lock<std::shared_mutex> base_table_lock(base.mutex);
+        
+        auto emit_row = [&](const PageRow& pr) {
+            std::vector<std::string> proj; proj.reserve(projections.size());
+            for (const auto& p : projections) proj.push_back(cell_value_string(base, pr, p.index));
+            out.rows.push_back(std::move(proj));
+        };
 
-    std::size_t base_join_idx = 0;
-    std::size_t right_join_idx_for_table = 0;
-    if (join_left_table == &base) {
-        base_join_idx = left_join_idx;
-        right_join_idx_for_table = right_join_idx;
-    } else {
-        base_join_idx = right_join_idx;
-        right_join_idx_for_table = left_join_idx;
-    }
-
-    DataType join_cmp_type = base.columns[base_join_idx].type;
-    if (base.columns[base_join_idx].type != right.columns[right_join_idx_for_table].type) {
-        join_cmp_type = DataType::kVarchar;
-    }
-
-    auto make_join_key = [&](const Table& table, std::size_t row_idx, std::size_t idx, std::string& key_out) -> bool {
-        double numeric_value = 0.0;
-        if ((join_cmp_type == DataType::kInt || join_cmp_type == DataType::kDecimal ||
-             join_cmp_type == DataType::kDatetime) && idx < table.numeric_column_valid.size() &&
-            idx < table.numeric_column_values.size() &&
-            row_idx < table.numeric_column_valid[idx].size() &&
-            row_idx < table.numeric_column_values[idx].size() &&
-            table.numeric_column_valid[idx][row_idx] != 0U) {
-            numeric_value = table.numeric_column_values[idx][row_idx];
-            if (join_cmp_type == DataType::kInt) {
-                long long n = static_cast<long long>(numeric_value);
-                key_out = "I:" + std::to_string(n);
-                return true;
-            }
-            if (join_cmp_type == DataType::kDecimal) {
-                std::ostringstream oss;
-                oss << std::setprecision(std::numeric_limits<double>::max_digits10) << numeric_value;
-                key_out = "D:" + oss.str();
-                return true;
-            }
-            long long ts = static_cast<long long>(numeric_value);
-            key_out = "T:" + std::to_string(ts);
-            return true;
-        }
-
-        if (row_idx >= table.rows.size() || idx >= table.rows[row_idx].values.size()) {
-            return false;
-        }
-        const std::string& raw = table.rows[row_idx].values[idx];
-        const std::string v = trim(raw);
-        if (is_null_literal_ci(v)) {
-            key_out = "N:";
-            return true;
-        }
-
-        if (join_cmp_type == DataType::kInt) {
-            std::int64_t n = 0;
-            if (!fast_parse_int64(v, n)) {
-                key_out = "X:" + v;
-                return true;
-            }
-            key_out = "I:" + std::to_string(n);
-            return true;
-        }
-        if (join_cmp_type == DataType::kDecimal) {
-            double d = 0.0;
-            if (!fast_parse_double(v, d)) {
-                key_out = "X:" + v;
-                return true;
-            }
-            std::ostringstream oss;
-            oss << std::setprecision(std::numeric_limits<double>::max_digits10) << d;
-            key_out = "D:" + oss.str();
-            return true;
-        }
-        if (join_cmp_type == DataType::kDatetime) {
-            std::int64_t ts = 0;
-            if (parse_datetime_to_unix(v, ts)) {
-                key_out = "T:" + std::to_string(ts);
+        if (skip_cache && plan.where.op == "=") {
+            const std::string rhs = unquote_literal(plan.where.value);
+            uint64_t loc = RobinHoodIndex::kEmpty;
+            if (base.pk_is_int) {
+                int64_t pk = 0; fast_parse_int64(rhs, pk);
+                loc = base.pk_robin_index.lookup(pk);
             } else {
-                key_out = "S:" + v;
+                auto it = base.primary_index.find(rhs);
+                if (it != base.primary_index.end()) loc = it->second;
             }
-            return true;
-        }
-        key_out = "S:" + v;
-        return true;
-    };
-
-    auto try_int_join_key = [&](const Table& table,
-                                std::size_t row_idx,
-                                std::size_t idx,
-                                std::int64_t& key_out) -> bool {
-        if (idx >= table.columns.size() || table.columns[idx].type != DataType::kInt) {
-            return false;
-        }
-
-        if (idx < table.numeric_column_valid.size() && idx < table.numeric_column_values.size() &&
-            row_idx < table.numeric_column_valid[idx].size() &&
-            row_idx < table.numeric_column_values[idx].size() &&
-            table.numeric_column_valid[idx][row_idx] != 0U) {
-            key_out = static_cast<std::int64_t>(table.numeric_column_values[idx][row_idx]);
-            return true;
-        }
-
-        if (row_idx >= table.rows.size() || idx >= table.rows[row_idx].values.size()) {
-            return false;
-        }
-
-        const std::string& raw = table.rows[row_idx].values[idx];
-        if (is_null_literal_ci(raw)) {
-            return false;
-        }
-        return fast_parse_int64(raw, key_out);
-    };
-
-    const Table* hash_table = &base;
-    const Table* probe_table = &right;
-    std::size_t hash_idx = base_join_idx;
-    std::size_t probe_idx = right_join_idx_for_table;
-    bool hash_is_base = true;
-
-    if (right.rows.size() < base.rows.size()) {
-        hash_table = &right;
-        probe_table = &base;
-        hash_idx = right_join_idx_for_table;
-        probe_idx = base_join_idx;
-        hash_is_base = false;
-    }
-
-    std::unordered_map<std::int64_t, std::vector<std::size_t>> join_hash_int;
-    std::unordered_map<std::string, std::vector<std::size_t>> join_hash_str;
-    const bool join_use_int = (join_cmp_type == DataType::kInt);
-    const bool join_is_eq = (plan.join_op == "=");
-    if (join_use_int) {
-        join_hash_int.reserve(hash_table->rows.size() > 0 ? hash_table->rows.size() : 1);
-    }
-    join_hash_str.reserve(hash_table->rows.size() > 0 ? hash_table->rows.size() : 1);
-
-    for (std::size_t hash_row_idx = 0; hash_row_idx < hash_table->rows.size(); ++hash_row_idx) {
-        const Row& row = hash_table->rows[hash_row_idx];
-        if (!row_alive(row, now_ts)) continue;
-        if (join_use_int) {
-            std::int64_t int_key = 0;
-            if (try_int_join_key(*hash_table, hash_row_idx, hash_idx, int_key)) {
-                join_hash_int[int_key].push_back(hash_row_idx);
-                continue;
-            }
-        }
-
-        std::string key;
-        if (!make_join_key(*hash_table, hash_row_idx, hash_idx, key)) {
-            error = "failed to compute join key"; return false;
-        }
-        join_hash_str[key].push_back(hash_row_idx);
-    }
-
-    for (std::size_t probe_row_idx = 0; probe_row_idx < probe_table->rows.size(); ++probe_row_idx) {
-        const Row& probe_row = probe_table->rows[probe_row_idx];
-        if (!row_alive(probe_row, now_ts)) {
-            continue;
-        }
-
-        std::vector<std::size_t> nl_matches;
-        std::vector<std::size_t>* hit_rows = nullptr;
-        if (join_is_eq) {
-            if (join_use_int) {
-                std::int64_t int_key = 0;
-                if (try_int_join_key(*probe_table, probe_row_idx, probe_idx, int_key)) {
-                    auto hit = join_hash_int.find(int_key);
-                    if (hit != join_hash_int.end()) hit_rows = &hit->second;
+            if (loc != RobinHoodIndex::kEmpty) {
+                PageRow pr = fetch_row_from_buf(base.buf_pool.get(), loc);
+                if (row_alive(pr, now_ts)) {
+                    if (evaluate_where(base, pr, plan.where, &error)) {
+                        emit_row(pr);
+                    } else if (!error.empty()) {
+                        return false;
+                    }
                 }
             }
-            if (hit_rows == nullptr) {
-                std::string key;
-                if (!make_join_key(*probe_table, probe_row_idx, probe_idx, key)) {
-                    error = "failed to compute join key"; return false;
-                }
-                auto hit = join_hash_str.find(key);
-                if (hit != join_hash_str.end()) hit_rows = &hit->second;
-            }
-            if (!hit_rows) continue;
         } else {
-            // Non-equality JOIN: nested loop over hash table rows
-            for (std::size_t hash_row_idx = 0; hash_row_idx < hash_table->rows.size(); ++hash_row_idx) {
-                if (!row_alive(hash_table->rows[hash_row_idx], now_ts)) continue;
-                double lhs = 0.0, rhs = 0.0;
-                bool lhs_ok = false, rhs_ok = false;
-                if (join_use_int) {
-                    std::int64_t a = 0, b = 0;
-                    lhs_ok = try_int_join_key(*probe_table, probe_row_idx, probe_idx, a);
-                    rhs_ok = try_int_join_key(*hash_table, hash_row_idx, hash_idx, b);
-                    if (lhs_ok) lhs = static_cast<double>(a);
-                    if (rhs_ok) rhs = static_cast<double>(b);
+            if (!base.buf_pool || !base.disk_mgr) return true;
+            TableIterator iter(*base.buf_pool, base.disk_mgr->num_pages());
+            while (iter.valid()) {
+                const PageRow& pr = iter.current();
+                if (row_alive(pr, now_ts)) {
+                    bool pass = true;
+                    if (plan.where.present) {
+                        pass = evaluate_where(base, pr, plan.where, &error);
+                        if (!error.empty()) return false;
+                    }
+                    if (pass) emit_row(pr);
                 }
-                if (!lhs_ok || !rhs_ok) {
-                    std::string pk, hk;
-                    make_join_key(*probe_table, probe_row_idx, probe_idx, pk);
-                    make_join_key(*hash_table, hash_row_idx, hash_idx, hk);
-                    // Strip type prefix (D:, I:, T:, S:, N:)
-                    auto strip = [](const std::string& s) {
-                        if (s.size() > 2 && s[1] == ':') return s.substr(2);
-                        return s;
-                    };
-                    lhs_ok = fast_parse_double(strip(pk), lhs);
-                    rhs_ok = fast_parse_double(strip(hk), rhs);
-                    if (!lhs_ok || !rhs_ok) continue;
-                }
-                bool pass = false;
-                // If hash_is_base is false, probe=base and hash=right — operator is correct
-                // If hash_is_base is true, probe=right and hash=base — flip operator
-                std::string effective_op = plan.join_op;
-                if (hash_is_base) {
-                    if (plan.join_op == ">") effective_op = "<";
-                    else if (plan.join_op == "<") effective_op = ">";
-                    else if (plan.join_op == ">=") effective_op = "<=";
-                    else if (plan.join_op == "<=") effective_op = ">=";
-                }
-                eval_numeric_op(lhs, rhs, effective_op, pass);
-                if (pass) nl_matches.push_back(hash_row_idx);
+                iter.next();
             }
-            hit_rows = &nl_matches;
-            if (nl_matches.empty()) continue;
+        }
+    } else {
+        std::shared_lock<std::shared_mutex> ta(base.name <= right_ptr->name ? base.mutex : right_ptr->mutex);
+        std::shared_lock<std::shared_mutex> tb(base.name <= right_ptr->name ? right_ptr->mutex : base.mutex);
+        
+        std::string lj_tbl, lj_col, rj_tbl, rj_col;
+        split_qualified(plan.join_left, lj_tbl, lj_col);
+        split_qualified(plan.join_right, rj_tbl, rj_col);
+        const Table* join_left_table = (lj_tbl == base.name) ? &base : right_ptr;
+        const Table* join_right_table = (rj_tbl == base.name) ? &base : right_ptr;
+        std::size_t left_join_idx = 0, right_join_idx = 0; std::string err;
+        lookup_column(*join_left_table, lj_col, left_join_idx, err);
+        lookup_column(*join_right_table, rj_col, right_join_idx, err);
+
+        const Table* hash_table = &base; const Table* probe_table = right_ptr;
+        std::size_t hash_idx = (join_left_table == &base) ? left_join_idx : right_join_idx;
+        std::size_t probe_idx = (join_left_table == right_ptr) ? left_join_idx : right_join_idx;
+        bool hash_is_base = true;
+
+        std::unordered_map<std::string, std::vector<PageRow>> join_hash_str;
+        
+        if (hash_table->buf_pool && hash_table->disk_mgr) {
+            TableIterator hit(*hash_table->buf_pool, hash_table->disk_mgr->num_pages());
+            while (hit.valid()) {
+                const PageRow& pr = hit.current();
+                if (row_alive(pr, now_ts)) {
+                    join_hash_str[pr.values[hash_idx]].push_back(pr);
+                }
+                hit.next();
+            }
         }
 
-        for (std::size_t matched_row_idx : *hit_rows) {
-            const std::size_t base_row_idx = hash_is_base ? matched_row_idx : probe_row_idx;
-            const std::size_t right_row_idx = hash_is_base ? probe_row_idx : matched_row_idx;
-            const Row* base_row_ptr = &base.rows[base_row_idx];
-            const Row* right_row_ptr = &right.rows[right_row_idx];
+        if (probe_table->buf_pool && probe_table->disk_mgr) {
+            TableIterator pit(*probe_table->buf_pool, probe_table->disk_mgr->num_pages());
+            while (pit.valid()) {
+                const PageRow& probe_row = pit.current();
+                if (!row_alive(probe_row, now_ts)) { pit.next(); continue; }
 
-            std::string where_error;
-            bool pass = evaluate_where_join(base,
-                                            *base_row_ptr,
-                                            base_row_idx,
-                                            right,
-                                            *right_row_ptr,
-                                            right_row_idx,
-                                            plan.where,
-                                            &where_error);
-            if (!where_error.empty()) {
-                error = where_error;
-                return false;
-            }
-            if (!pass) {
-                continue;
-            }
-
-            std::vector<std::string> projected;
-            projected.reserve(projections.size());
-            for (const Projection& p : projections) {
-                if (p.table == &base) {
-                    projected.push_back(cell_value_string(base, base_row_idx, p.index));
+                if (plan.join_op == "=") {
+                    auto it = join_hash_str.find(probe_row.values[probe_idx]);
+                    if (it != join_hash_str.end()) {
+                        for (const PageRow& hash_row : it->second) {
+                            const PageRow* base_r = hash_is_base ? &hash_row : &probe_row;
+                            const PageRow* right_r = hash_is_base ? &probe_row : &hash_row;
+                            if (evaluate_where_join(base, *base_r, *right_ptr, *right_r, plan.where, &error)) {
+                                std::vector<std::string> proj; proj.reserve(projections.size());
+                                for (const auto& p : projections) {
+                                    proj.push_back(cell_value_string(*(p.table), p.table == &base ? *base_r : *right_r, p.index));
+                                }
+                                out.rows.push_back(std::move(proj));
+                            }
+                        }
+                    }
                 } else {
-                    projected.push_back(cell_value_string(right, right_row_idx, p.index));
+                    // Nested loop for non-equality
+                    for (const auto& [_, hash_rows] : join_hash_str) {
+                        for (const PageRow& hash_row : hash_rows) {
+                            const PageRow* base_r = hash_is_base ? &hash_row : &probe_row;
+                            const PageRow* right_r = hash_is_base ? &probe_row : &hash_row;
+                            
+                            double lhs = 0, rhs = 0;
+                            bool lhs_ok = fast_parse_double(probe_row.values[probe_idx], lhs);
+                            bool rhs_ok = fast_parse_double(hash_row.values[hash_idx], rhs);
+                            bool pass = false;
+                            
+                            std::string effective_op = plan.join_op;
+                            if (hash_is_base) {
+                                if (effective_op == ">") effective_op = "<";
+                                else if (effective_op == "<") effective_op = ">";
+                                else if (effective_op == ">=") effective_op = "<=";
+                                else if (effective_op == "<=") effective_op = ">=";
+                            }
+
+                            if (lhs_ok && rhs_ok) {
+                                eval_numeric_op(lhs, rhs, effective_op, pass);
+                            } else {
+                                std::string dummy_err;
+                                compare_values(probe_row.values[probe_idx], hash_row.values[hash_idx], DataType::kVarchar, effective_op, pass, dummy_err);
+                            }
+                            
+                            if (pass && evaluate_where_join(base, *base_r, *right_ptr, *right_r, plan.where, &error)) {
+                                std::vector<std::string> proj; proj.reserve(projections.size());
+                                for (const auto& p : projections) {
+                                    proj.push_back(cell_value_string(*(p.table), p.table == &base ? *base_r : *right_r, p.index));
+                                }
+                                out.rows.push_back(std::move(proj));
+                            }
+                        }
+                    }
                 }
+                pit.next();
             }
-            out.rows.push_back(std::move(projected));
         }
     }
 
-    if (!skip_cache) {
-        cache_.put(cache_key, out, versions, binary_wire);
+    if (plan.order_by.present) {
+        std::size_t sort_col_idx = 0;
+        for (std::size_t i = 0; i < out.columns.size(); ++i) {
+            if (out.columns[i] == plan.order_by.column) { sort_col_idx = i; break; }
+        }
+        DataType sort_type = DataType::kVarchar;
+        auto col_it = base.column_index.find(plan.order_by.column);
+        if (col_it != base.column_index.end()) sort_type = base.columns[col_it->second].type;
+        bool desc = plan.order_by.descending;
+        std::stable_sort(out.rows.begin(), out.rows.end(),
+            [&](const std::vector<std::string>& a, const std::vector<std::string>& b) {
+                const std::string& av = a[sort_col_idx];
+                const std::string& bv = b[sort_col_idx];
+                bool less = false;
+                if (sort_type == DataType::kInt) { int64_t ai=0, bi=0; fast_parse_int64(av, ai); fast_parse_int64(bv, bi); less = ai < bi; }
+                else if (sort_type == DataType::kDecimal) { double ad=0, bd=0; fast_parse_double(av, ad); fast_parse_double(bv, bd); less = ad < bd; }
+                else less = av < bv;
+                return desc ? !less : less;
+            });
     }
+
+    if (!skip_cache) cache_.put(cache_key, out, versions, binary_wire);
     return true;
 }
-
 bool SqlEngine::parse_create_table(const std::string& sql,
                                    std::string& table_name,
                                    std::vector<Column>& columns,
@@ -1856,59 +1378,7 @@ bool SqlEngine::evaluate_where(const Table& table, const PageRow& row, const Con
     const std::string rhs = unquote_literal(condition.value);
     std::string cmp_error;
     if (!compare_values(cell_value_string(table, row, idx), rhs, col->type, condition.op, result, cmp_error)) {
-        if (error) *error = cmp_error; return false;
-    }
-    return result;
-}
-
-bool SqlEngine::evaluate_where_join
-    if (!condition.present) {
-        return true;
-    }
-
-    std::string cond_table;
-    std::string cond_col;
-    split_qualified(condition.column, cond_table, cond_col);
-    std::string raw_col = cond_col.empty() ? condition.column : cond_col;
-
-    if (!cond_table.empty() && cond_table != table.name) {
-        if (error != nullptr) {
-            *error = "WHERE references unknown table: " + cond_table;
-        }
-        return false;
-    }
-
-    std::size_t idx = 0;
-    std::string lookup_error;
-    const Column* col = lookup_column(table, raw_col, idx, lookup_error);
-    if (col == nullptr) {
-        if (error != nullptr) {
-            *error = lookup_error;
-        }
-        return false;
-    }
-
-    bool result = false;
-    const std::string rhs = unquote_literal(condition.value);
-    double rhs_num = 0.0;
-    double lhs_num = 0.0;
-    if ((col->type == DataType::kInt || col->type == DataType::kDecimal || col->type == DataType::kDatetime) &&
-        row_numeric_value(table, row_idx, idx, lhs_num) &&
-        parse_numeric_literal(rhs, col->type, rhs_num)) {
-        if (!eval_numeric_op(lhs_num, rhs_num, condition.op, result)) {
-            if (error != nullptr) {
-                *error = "unsupported operator in WHERE: " + condition.op;
-            }
-            return false;
-        }
-        return result;
-    }
-
-    std::string cmp_error;
-    if (!compare_values(cell_value_string(table, row_idx, idx), rhs, col->type, condition.op, result, cmp_error)) {
-        if (error != nullptr) {
-            *error = cmp_error;
-        }
+        if (error) { *error = cmp_error; }
         return false;
     }
     return result;
@@ -1936,101 +1406,9 @@ bool SqlEngine::evaluate_where_join(const Table& left, const PageRow& left_row, 
     if (!col) { if (error) *error = lookup_error; return false; }
     bool result = false; std::string cmp_error;
     if (!compare_values(cell_value_string(*table, *row_ptr, idx), unquote_literal(condition.value), col->type, condition.op, result, cmp_error)) {
-        if (error) *error = cmp_error; return false;
-    }
-    return result;
-}
-
-std::unordered_map<std::string, std::uint64_t>
-    if (!condition.present) {
-        return true;
-    }
-
-    std::string cond_table;
-    std::string cond_col;
-    split_qualified(condition.column, cond_table, cond_col);
-    std::string raw_col = cond_col.empty() ? condition.column : cond_col;
-
-    const Table* table = nullptr;
-    std::size_t row_idx = 0;
-
-    if (cond_table.empty()) {
-        std::size_t dummy = 0;
-        std::string err1;
-        std::string err2;
-        bool in_left = lookup_column(left, raw_col, dummy, err1) != nullptr;
-        bool in_right = lookup_column(right, raw_col, dummy, err2) != nullptr;
-        if (in_left && in_right) {
-            if (error != nullptr) {
-                *error = "ambiguous column in WHERE: " + raw_col;
-            }
-            return false;
-        }
-        if (!in_left && !in_right) {
-            if (error != nullptr) {
-                *error = "unknown column in WHERE: " + raw_col;
-            }
-            return false;
-        }
-        if (in_left) {
-            table = &left;
-            row_idx = left_row_idx;
-        } else {
-            table = &right;
-            row_idx = right_row_idx;
-        }
-    } else if (cond_table == left.name) {
-        table = &left;
-        row_idx = left_row_idx;
-    } else if (cond_table == right.name) {
-        table = &right;
-        row_idx = right_row_idx;
-    } else {
-        if (error != nullptr) {
-            *error = "WHERE references unknown table: " + cond_table;
-        }
+        if (error) { *error = cmp_error; }
         return false;
     }
-
-    std::size_t idx = 0;
-    std::string lookup_error;
-    const Column* col = lookup_column(*table, raw_col, idx, lookup_error);
-    if (col == nullptr) {
-        if (error != nullptr) {
-            *error = lookup_error;
-        }
-        return false;
-    }
-
-    bool result = false;
-    const std::string rhs = unquote_literal(condition.value);
-    double rhs_num = 0.0;
-    double lhs_num = 0.0;
-    if ((col->type == DataType::kInt || col->type == DataType::kDecimal || col->type == DataType::kDatetime) &&
-        row_numeric_value(*table, row_idx, idx, lhs_num) &&
-        parse_numeric_literal(rhs, col->type, rhs_num)) {
-        if (!eval_numeric_op(lhs_num, rhs_num, condition.op, result)) {
-            if (error != nullptr) {
-                *error = "unsupported operator in WHERE: " + condition.op;
-            }
-            return false;
-        }
-        return result;
-    }
-
-    std::string cmp_error;
-    if (!compare_values(cell_value_string(*table, row_idx, idx),
-                        rhs,
-                        col->type,
-                        condition.op,
-                        result,
-                        cmp_error)) {
-        if (error != nullptr) {
-            *error = cmp_error;
-        }
-        return false;
-    }
-
     return result;
 }
 
@@ -2503,55 +1881,12 @@ bool SqlEngine::row_alive(const PageRow& row, std::int64_t now_ts) {
     return row.expires_at == 0 || row.expires_at > now_ts;
 }
 
-bool SqlEngine::row_numeric_value(const Table& table,
-                                  std::size_t row_idx,
-                                  std::size_t col_idx,
-                                  double& out) {
-    if (col_idx >= table.numeric_column_valid.size() || col_idx >= table.numeric_column_values.size()) {
-        return false;
-    }
-    const auto& valid = table.numeric_column_valid[col_idx];
-    const auto& values = table.numeric_column_values[col_idx];
-    if (row_idx >= valid.size() || row_idx >= values.size() || valid[row_idx] == 0U) {
-        return false;
-    }
-    out = values[row_idx];
-    return true;
-}
 
 std::string SqlEngine::cell_value_string(const Table& table, const PageRow& row, std::size_t col_idx) const {
     if (col_idx >= table.columns.size() || col_idx >= row.values.size()) return {};
     return row.values[col_idx];
 }
 
-bool SqlEngine::validate_typed_value
-    if (row_idx >= table.rows.size() || col_idx >= table.columns.size()) return {};
-    const Row& row = table.rows[row_idx];
-    if (col_idx >= row.values.size()) return {};
-
-    const std::string& raw = row.values[col_idx];
-    if (!raw.empty()) return raw;
-
-    const Column& col = table.columns[col_idx];
-    if (col.type != DataType::kInt && col.type != DataType::kDecimal) return raw;
-
-    double numeric = 0.0;
-    if (!row_numeric_value(table, row_idx, col_idx, numeric)) return raw;
-
-    if (col.type == DataType::kInt) {
-        return std::to_string(static_cast<long long>(numeric));
-    }
-
-    char buf[64];
-    // If whole number, format as integer to avoid scientific notation
-    if (numeric == static_cast<double>(static_cast<long long>(numeric))) {
-        auto conv = std::to_chars(buf, buf + sizeof(buf), static_cast<long long>(numeric));
-        if (conv.ec == std::errc{}) return std::string(buf, conv.ptr);
-    }
-    auto conv = std::to_chars(buf, buf + sizeof(buf), numeric, std::chars_format::general);
-    if (conv.ec == std::errc{}) return std::string(buf, conv.ptr);
-    return std::to_string(numeric);
-}
 
 bool SqlEngine::validate_typed_value(const Column& col,
                                      std::string& value,
@@ -2690,7 +2025,7 @@ void flexql::SqlEngine::checkpoint_to_disk() {
     for (auto& [name, table] : tables_) {
         std::shared_lock<std::shared_mutex> tlock(table.mutex);
         if (table.buf_pool) {
-            table.buf_pool->flush_all();
+            table.buf_pool->flush_all(/*sync=*/true);  // fdatasync for durability
         }
     }
 }

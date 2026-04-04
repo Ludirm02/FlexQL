@@ -50,10 +50,6 @@ private:
         bool primary_key = false;
     };
 
-    struct Row {
-        std::vector<std::string> values;
-        std::int64_t expires_at_unix = 0;
-    };
 
     struct Table {
         std::string name;
@@ -144,11 +140,7 @@ private:
                                   const PageRow& row,
                                   std::size_t col_idx) const;
 
-    bool validate_typed_value(const Column& col,
-                              std::string& value,
-                              std::string& error,
-                              double* numeric_out,
-                              bool* numeric_valid) const;
+
 
     bool evaluate_where(const Table& table,
                         const PageRow& row,
@@ -205,14 +197,7 @@ private:
     static std::size_t find_keyword(const std::string& sql_upper,
                                     const std::string& kw,
                                     std::size_t start = 0);
-    static bool row_alive(const Row& row, std::int64_t now_ts);
-    static bool row_numeric_value(const Table& table,
-                                  std::size_t row_idx,
-                                  std::size_t col_idx,
-                                  double& out);
-    std::string cell_value_string(const Table& table,
-                                  std::size_t row_idx,
-                                  std::size_t col_idx) const;
+
 
     bool validate_typed_value(const Column& col,
                               std::string& value,

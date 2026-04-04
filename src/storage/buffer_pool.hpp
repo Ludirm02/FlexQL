@@ -56,11 +56,23 @@ public:
         if (f.pin_count > 0) f.pin_count--;
         if (dirty) f.dirty = true;
     }
-    void flush_all() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& [pid, fid] : page_table_) {
-            if (frames_[fid].dirty) { dm_.write_page(pid, frames_[fid].page); frames_[fid].dirty = false; }
+    // flush_all: write all dirty frames. If sync=true, fdatasync afterward.
+    void flush_all(bool sync = false) {
+        // Collect dirty pages under lock, then write without holding lock
+        std::vector<std::pair<page_id_t, Page>> dirty;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto& [pid, fid] : page_table_) {
+                if (frames_[fid].dirty) {
+                    dirty.emplace_back(pid, frames_[fid].page);
+                    frames_[fid].dirty = false;
+                }
+            }
         }
+        for (auto& [pid, pg] : dirty) {
+            dm_.write_page(pid, pg);
+        }
+        if (sync) dm_.fsync_data();
     }
     std::size_t pool_size() const { return pool_size_; }
 private:

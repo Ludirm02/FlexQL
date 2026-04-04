@@ -7,6 +7,9 @@
 #include <filesystem>
 #include <vector>
 #include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+#include <atomic>
 
 static constexpr std::size_t PAGE_SIZE = 8192;
 using page_id_t = std::int64_t;
@@ -51,44 +54,60 @@ public:
     explicit DiskManager(const std::string& table_name) : table_name_(table_name) {
         std::filesystem::create_directories("data/pages");
         path_ = "data/pages/" + table_name + ".db";
-        if (!std::filesystem::exists(path_)) { std::ofstream f(path_, std::ios::binary); }
-        file_.open(path_, std::ios::in | std::ios::out | std::ios::binary);
-        if (file_.is_open()) {
-            file_.seekg(0, std::ios::end);
-            auto sz = file_.tellg();
-            num_pages_ = static_cast<page_id_t>(sz / PAGE_SIZE);
+        // Use raw fd + pread/pwrite: bypasses C++ stream buffering, fully thread-safe
+        fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0644);
+        if (fd_ >= 0) {
+            off_t sz = ::lseek(fd_, 0, SEEK_END);
+            if (sz > 0) {
+                num_pages_.store(
+                    static_cast<page_id_t>(sz / static_cast<off_t>(PAGE_SIZE)),
+                    std::memory_order_release);
+            }
         }
     }
-    ~DiskManager() { if (file_.is_open()) file_.close(); }
+    ~DiskManager() {
+        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    }
+
+    // pread: position-independent, thread-safe, no seekp/seekg races
     bool read_page(page_id_t pid, Page& page) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (pid < 0 || pid >= num_pages_) return false;
-        file_.seekg(pid * static_cast<std::streamoff>(PAGE_SIZE), std::ios::beg);
-        file_.read(page.data, PAGE_SIZE);
-        return file_.good();
+        if (pid < 0 || pid >= num_pages_.load(std::memory_order_acquire)) return false;
+        off_t off = static_cast<off_t>(pid) * static_cast<off_t>(PAGE_SIZE);
+        ssize_t n = ::pread(fd_, page.data, PAGE_SIZE, off);
+        return n == static_cast<ssize_t>(PAGE_SIZE);
     }
+
+    // pwrite: position-independent, goes straight to OS page cache (no flush needed)
+    // NO fdatasync — only at checkpoint/shutdown
     bool write_page(page_id_t pid, const Page& page) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        file_.seekp(pid * static_cast<std::streamoff>(PAGE_SIZE), std::ios::beg);
-        file_.write(page.data, PAGE_SIZE);
-        file_.flush();
-        return file_.good();
+        if (pid < 0) return false;
+        off_t off = static_cast<off_t>(pid) * static_cast<off_t>(PAGE_SIZE);
+        ssize_t n = ::pwrite(fd_, page.data, PAGE_SIZE, off);
+        return n == static_cast<ssize_t>(PAGE_SIZE);
     }
+
+    // Atomically extend the file by one blank page
     page_id_t allocate_page(Page& page) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        page_id_t pid = num_pages_++;
+        std::lock_guard<std::mutex> lock(alloc_mutex_);
+        page_id_t pid = num_pages_.fetch_add(1, std::memory_order_acq_rel);
         page.reset(pid);
-        file_.seekp(0, std::ios::end);
-        file_.write(page.data, PAGE_SIZE);
-        file_.flush();
+        off_t off = static_cast<off_t>(pid) * static_cast<off_t>(PAGE_SIZE);
+        [[maybe_unused]] ssize_t n2 = ::pwrite(fd_, page.data, PAGE_SIZE, off);
         return pid;
     }
-    page_id_t num_pages() const { return num_pages_; }
+
+    // Flush OS page cache to physical disk — call at checkpoint/shutdown ONLY
+    void fsync_data() {
+        if (fd_ >= 0) ::fdatasync(fd_);
+    }
+
+    page_id_t num_pages() const { return num_pages_.load(std::memory_order_acquire); }
     const std::string& table_name() const { return table_name_; }
+
 private:
-    std::string table_name_;
-    std::string path_;
-    std::fstream file_;
-    std::mutex mutex_;
-    page_id_t num_pages_ = 0;
+    std::string             table_name_;
+    std::string             path_;
+    int                     fd_ = -1;
+    std::atomic<page_id_t>  num_pages_{0};
+    std::mutex              alloc_mutex_;  // serializes fetch_add + pwrite in allocate_page
 };

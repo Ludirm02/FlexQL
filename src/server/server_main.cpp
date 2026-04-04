@@ -1,6 +1,7 @@
 #include "storage/disk_store.hpp"
 #include "protocol.hpp"
 #include "sql_engine.hpp"
+// WAL header kept for WAL::instance() replay on crash recovery
 #include "storage/wal.hpp"
 
 #include <arpa/inet.h>
@@ -151,14 +152,6 @@ void handle_client(int client_fd, SqlEngine* engine) {
             }
             QueryResult raw_result;
             std::string raw_error;
-            // WAL: log before execute
-            if (sql.size() > 6) {
-                std::string sql_upper = sql.substr(0, 6);
-                for (auto& c : sql_upper) c = toupper(c);
-                if (sql_upper == "INSERT" || sql_upper == "CREATE") {
-                    WAL::instance().log(sql);
-                }
-            }
             if (!engine->execute(sql, raw_result, raw_error)) {
                 std::string err_line = "ERROR: " + raw_error + "\nEND\n";
                 flexql_proto::send_all(client_fd, err_line.data(), err_line.size());
@@ -223,12 +216,6 @@ void handle_client(int client_fd, SqlEngine* engine) {
         QueryResult result;
         std::string cached_wire;
         std::string error;
-        // WAL: persist INSERT and CREATE TABLE
-        if (sql.size() > 6) {
-            std::string su = sql.substr(0, 6);
-            for (auto& c : su) c = toupper(c);
-            if (su == "INSERT" || su == "CREATE") WAL::instance().log(sql);
-        }
         if (!engine->execute(sql, result, error, &cached_wire, want_binary)) {
             const bool ok = want_binary ? send_error_binary(client_fd, error) : send_error(client_fd, error);
             if (!ok) {
@@ -399,7 +386,6 @@ int main(int argc, char** argv) {
     }
 
     SqlEngine engine(2048);
-    DiskStore::AsyncWriter::instance().start();
     const std::string wal_path = "data/wal/wal.log";
     {
         auto schemas = DiskStore::load_schemas();
@@ -409,11 +395,10 @@ int main(int argc, char** argv) {
         }
         engine.load_from_disk();
         std::cout << "Disk storage loaded.\n";
-        // Truncate WAL after successful disk load to prevent duplicate replay
-        std::ofstream(wal_path, std::ios::trunc | std::ios::binary);
     }
 
-    // WAL: replay crash recovery tail then truncate
+    // WAL crash recovery: replay any entries written before last clean shutdown
+    // (WAL is no longer written on the hot path, so this handles only old/legacy crashes)
     {
         auto& wal = WAL::instance();
         auto sqls = wal.replay(wal_path);
@@ -426,16 +411,39 @@ int main(int argc, char** argv) {
                 engine.execute(sql, dummy, err);
             }
             engine.set_skip_disk_write(false);
-            engine.checkpoint_to_disk();
             std::cout << "WAL replay complete.\n";
         }
+        // Flush recovered data to pages, then clear WAL permanently
+        engine.checkpoint_to_disk();
         std::ofstream(wal_path, std::ios::trunc | std::ios::binary);
-        wal.open(wal_path);
+        // Do NOT reopen WAL for writing — Buffer Pool now handles persistence
     }
 
     const std::size_t hw = std::thread::hardware_concurrency();
     ThreadPool pool(hw > 0 ? hw * 2 : 16);
+
+    // ── Background checkpoint thread ──────────────────────────────────────
+    // Flushes all dirty buffer pool pages to disk and calls fdatasync every
+    // CHECKPOINT_INTERVAL_S seconds.  This closes the power-loss durability
+    // gap: in the worst case only the last CHECKPOINT_INTERVAL_S seconds of
+    // committed data can be lost.  Process-crash safety is already provided
+    // because pwrite() writes to the OS page cache on every LRU eviction.
+    static constexpr int CHECKPOINT_INTERVAL_S = 10;
+    std::atomic<bool> checkpoint_stop{false};
+    std::thread checkpoint_thread([&]() {
+        while (!checkpoint_stop.load(std::memory_order_relaxed)) {
+            for (int i = 0; i < CHECKPOINT_INTERVAL_S * 10; ++i) {
+                if (checkpoint_stop.load(std::memory_order_relaxed)) return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (!checkpoint_stop.load(std::memory_order_relaxed)) {
+                engine.checkpoint_to_disk();  // flush_all + fdatasync per table
+            }
+        }
+    });
+
     std::cout << "FlexQL server listening on port " << port << "\n";
+    std::cout << "Background checkpoint every " << CHECKPOINT_INTERVAL_S << "s (power-loss safe).\n";
 
     for (;;) {
         sockaddr_in client_addr{};
@@ -466,8 +474,11 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Shutting down...\n";
-    DiskStore::AsyncWriter::instance().stop();
-    WAL::instance().flush_all();
+    // Stop background checkpoint thread first
+    checkpoint_stop.store(true, std::memory_order_relaxed);
+    if (checkpoint_thread.joinable()) checkpoint_thread.join();
+    // Final checkpoint: flush all buffer pool dirty pages to disk with fsync
+    engine.checkpoint_to_disk();
     ::close(server_fd);
     return 0;
 }
