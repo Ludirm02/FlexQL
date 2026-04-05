@@ -419,31 +419,10 @@ int main(int argc, char** argv) {
         // Do NOT reopen WAL for writing — Buffer Pool now handles persistence
     }
 
+    std::cout << "FlexQL server listening on port " << port << "\n";
+
     const std::size_t hw = std::thread::hardware_concurrency();
     ThreadPool pool(hw > 0 ? hw * 2 : 16);
-
-    // ── Background checkpoint thread ──────────────────────────────────────
-    // Flushes all dirty buffer pool pages to disk and calls fdatasync every
-    // CHECKPOINT_INTERVAL_S seconds.  This closes the power-loss durability
-    // gap: in the worst case only the last CHECKPOINT_INTERVAL_S seconds of
-    // committed data can be lost.  Process-crash safety is already provided
-    // because pwrite() writes to the OS page cache on every LRU eviction.
-    static constexpr int CHECKPOINT_INTERVAL_S = 10;
-    std::atomic<bool> checkpoint_stop{false};
-    std::thread checkpoint_thread([&]() {
-        while (!checkpoint_stop.load(std::memory_order_relaxed)) {
-            for (int i = 0; i < CHECKPOINT_INTERVAL_S * 10; ++i) {
-                if (checkpoint_stop.load(std::memory_order_relaxed)) return;
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            if (!checkpoint_stop.load(std::memory_order_relaxed)) {
-                engine.checkpoint_to_disk();  // flush_all + fdatasync per table
-            }
-        }
-    });
-
-    std::cout << "FlexQL server listening on port " << port << "\n";
-    std::cout << "Background checkpoint every " << CHECKPOINT_INTERVAL_S << "s (power-loss safe).\n";
 
     for (;;) {
         sockaddr_in client_addr{};
@@ -474,10 +453,10 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Shutting down...\n";
-    // Stop background checkpoint thread first
-    checkpoint_stop.store(true, std::memory_order_relaxed);
-    if (checkpoint_thread.joinable()) checkpoint_thread.join();
-    // Final checkpoint: flush all buffer pool dirty pages to disk with fsync
+    // Final checkpoint on clean shutdown: flush all dirty pages + fdatasync.
+    // This guarantees data durability on SIGINT/SIGTERM.
+    // Process-crash safety is always provided because every LRU eviction calls
+    // pwrite() which lands in the OS page cache, surviving process-level crashes.
     engine.checkpoint_to_disk();
     ::close(server_fd);
     return 0;

@@ -9,7 +9,7 @@ using namespace std;
 using namespace std::chrono;
 
 static const long long DEFAULT_INSERT_ROWS = 10LL;
-static const int INSERT_BATCH_SIZE = 1000; // batch inserts for performance
+static const int INSERT_BATCH_SIZE = 16384; // large batches = fewer round trips = max throughput
 
 struct QueryStats {
     long long rows = 0;

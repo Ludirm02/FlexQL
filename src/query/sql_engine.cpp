@@ -360,7 +360,7 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
     t.columns = columns;
     t.primary_key_col = primary_col;
     t.disk_mgr = std::make_unique<DiskManager>(table_name);
-    t.buf_pool = std::make_unique<BufferPoolManager>(*t.disk_mgr, 32768);
+    t.buf_pool = std::make_unique<BufferPoolManager>(*t.disk_mgr);
 
     if (primary_col >= 0) {
         if (columns[static_cast<std::size_t>(primary_col)].type == DataType::kInt) {
@@ -2021,11 +2021,16 @@ void flexql::SqlEngine::load_from_disk() {
 }
 
 void flexql::SqlEngine::checkpoint_to_disk() {
+    // Hold db_mutex_ (shared) only to prevent table map structural changes.
+    // Do NOT hold per-table table.mutex during I/O — that would block concurrent
+    // INSERTs which need exclusive table.mutex locks.  The buffer pool uses its
+    // own internal mutex for thread-safe flush_all() without needing table.mutex.
     std::shared_lock<std::shared_mutex> lock(db_mutex_);
     for (auto& [name, table] : tables_) {
-        std::shared_lock<std::shared_mutex> tlock(table.mutex);
         if (table.buf_pool) {
-            table.buf_pool->flush_all(/*sync=*/true);  // fdatasync for durability
+            // flush_all() collects dirty pages under buf_pool's own mutex (brief),
+            // then writes + fdatasyncs outside any table lock.
+            table.buf_pool->flush_all(/*sync=*/true);
         }
     }
 }

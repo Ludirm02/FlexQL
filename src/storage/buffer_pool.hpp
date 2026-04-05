@@ -15,7 +15,7 @@ struct Frame {
 
 class BufferPoolManager {
 public:
-    explicit BufferPoolManager(DiskManager& dm, std::size_t pool_size = 32768)
+    explicit BufferPoolManager(DiskManager& dm, std::size_t pool_size = 8192)
         : dm_(dm), pool_size_(pool_size) {
         frames_.resize(pool_size_);
         for (std::size_t i = 0; i < pool_size_; ++i) free_list_.push_back(i);
