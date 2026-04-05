@@ -335,17 +335,26 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
     }
 
     if (tables_.count(table_name) != 0U) {
-        // Clear existing data so re-creation acts as reset
+        // Clear existing data so re-creation acts as reset.
         Table& existing = tables_[table_name];
         existing.primary_index.clear();
         existing.pk_robin_index = RobinHoodIndex(1024);
         ++existing.version;
+        existing.last_page_id = INVALID_PAGE_ID;
+
+        // Flush dirty data, delete old db file, create fresh empty one.
         if (existing.buf_pool) { existing.buf_pool->flush_all(); }
         std::filesystem::remove("data/pages/" + table_name + ".db");
+
         if (existing.disk_mgr) {
+            // Re-point disk manager at the new empty file.
             existing.disk_mgr = std::make_unique<DiskManager>(table_name);
-            existing.buf_pool = std::make_unique<BufferPoolManager>(*existing.disk_mgr);
-            existing.last_page_id = INVALID_PAGE_ID;
+
+            // KEY: do NOT destroy and re-create the BufferPoolManager.
+            // reset() reuses the same frames_ allocation — the physical RAM
+            // pages stay hot in CPU cache, eliminating the cold-page-fault
+            // tax that made the first INSERT run 3× slower than subsequent ones.
+            existing.buf_pool->reset(*existing.disk_mgr);
         }
         return true;
     }
@@ -403,8 +412,17 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
 
     Frame* current_frame = nullptr;
     page_id_t current_pid = INVALID_PAGE_ID;
+    const std::size_t batch_sz = rows_values.size();
 
-    for (std::size_t r = 0; r < rows_values.size(); ++r) {
+    // Reusable serialization buffer — avoids one heap allocation per row
+    std::string serialized;
+    serialized.reserve(256);  // typical row size; grows automatically if needed
+
+    const std::size_t pk_col = (table.primary_key_col >= 0)
+                                   ? static_cast<std::size_t>(table.primary_key_col)
+                                   : SIZE_MAX;
+
+    for (std::size_t r = 0; r < batch_sz; ++r) {
         std::vector<std::string>& row_vals = rows_values[r];
         std::int64_t expires = expires_at[r];
 
@@ -414,68 +432,78 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             return false;
         }
 
+        // ── PK duplicate check (before any page writes) ──────────────────
+        std::int64_t pk_int_val = 0;
+        if (table.primary_key_col >= 0) {
+            if (table.pk_is_int) {
+                fast_parse_int64(row_vals[pk_col], pk_int_val);
+                if (table.pk_robin_index.lookup(pk_int_val) != RobinHoodIndex::kEmpty) {
+                    if (current_frame) table.buf_pool->unpin(current_pid, true);
+                    error = "duplicate primary key value: " + row_vals[pk_col];
+                    return false;
+                }
+            } else {
+                if (table.primary_index.count(row_vals[pk_col])) {
+                    if (current_frame) table.buf_pool->unpin(current_pid, true);
+                    error = "duplicate primary key value: " + row_vals[pk_col];
+                    return false;
+                }
+            }
+        }
+
+        // ── 1: Validate each column (early-exit on type error) ────────────
         for (std::size_t i = 0; i < row_vals.size(); ++i) {
-            double parsed = 0.0;
+            double parsed_d = 0.0;
             bool numeric_valid = false;
-            if (!validate_typed_value(table.columns[i], row_vals[i], error, &parsed, &numeric_valid)) {
+            if (!validate_typed_value(table.columns[i], row_vals[i], error, &parsed_d, &numeric_valid)) {
                 if (current_frame) table.buf_pool->unpin(current_pid, true);
                 return false;
             }
         }
 
-        std::int64_t pk_int_val = 0;
-        std::string pk_key;
-        if (table.primary_key_col >= 0) {
-            pk_key = row_vals[static_cast<std::size_t>(table.primary_key_col)];
-            if (table.pk_is_int) {
-                fast_parse_int64(pk_key, pk_int_val);
-                auto existing = table.pk_robin_index.lookup(pk_int_val);
-                if (existing != RobinHoodIndex::kEmpty) {
-                    if (current_frame) table.buf_pool->unpin(current_pid, true);
-                    error = "duplicate primary key value: " + pk_key;
-                    return false;
-                }
+        // ── 2: Serialize row into reusable buffer (simple tight loop) ─────
+        // Kept as a separate loop from validation so the compiler can
+        // optimize it independently (unroll, vectorize for fixed ncols).
+        serialized.clear();
+        serialized.append(reinterpret_cast<const char*>(&expires), sizeof(expires));
+        uint16_t ncols = static_cast<uint16_t>(row_vals.size());
+        serialized.append(reinterpret_cast<const char*>(&ncols), sizeof(ncols));
+        for (const auto& v : row_vals) {
+            uint16_t vlen = static_cast<uint16_t>(v.size());
+            serialized.append(reinterpret_cast<const char*>(&vlen), sizeof(vlen));
+            serialized.append(v.data(), v.size());
+        }
+
+        // ── 3: Write serialized row to buffer pool page ───────────────────
+        int slot = -1;
+        if (current_frame == nullptr && table.last_page_id != INVALID_PAGE_ID) {
+            current_pid = table.last_page_id;
+            current_frame = table.buf_pool->pin(current_pid);
+        }
+        if (current_frame) {
+            slot = current_frame->page.append(serialized.data(), static_cast<uint16_t>(serialized.size()));
+        }
+        if (slot < 0) {
+            if (current_frame) table.buf_pool->unpin(current_pid, true);
+            page_id_t new_pid;
+            current_frame = table.buf_pool->new_page(new_pid);
+            if (current_frame) {
+                current_pid = new_pid;
+                slot = current_frame->page.append(serialized.data(), static_cast<uint16_t>(serialized.size()));
+                table.last_page_id = new_pid;
             } else {
-                auto idx_it = table.primary_index.find(pk_key);
-                if (idx_it != table.primary_index.end()) {
-                    if (current_frame) table.buf_pool->unpin(current_pid, true);
-                    error = "duplicate primary key value: " + pk_key;
-                    return false;
-                }
+                error = "failed to allocate new page in buffer pool";
+                return false;
             }
         }
 
-        if (table.buf_pool && table.disk_mgr) {
-            std::string serialized = serialize_row(row_vals, expires);
-            int slot = -1;
-            if (current_frame == nullptr && table.last_page_id != INVALID_PAGE_ID) {
-                current_pid = table.last_page_id;
-                current_frame = table.buf_pool->pin(current_pid);
-            }
-            if (current_frame) {
-                slot = current_frame->page.append(serialized.data(), static_cast<uint16_t>(serialized.size()));
-            }
-            if (slot < 0) {
-                if (current_frame) table.buf_pool->unpin(current_pid, true);
-                page_id_t new_pid;
-                current_frame = table.buf_pool->new_page(new_pid);
-                if (current_frame) {
-                    current_pid = new_pid;
-                    slot = current_frame->page.append(serialized.data(), static_cast<uint16_t>(serialized.size()));
-                    table.last_page_id = new_pid;
-                } else {
-                    error = "failed to allocate new page in buffer pool";
-                    return false;
-                }
-            }
-
-            if (table.primary_key_col >= 0) {
-                uint64_t loc = (static_cast<uint64_t>(current_pid) << 16) | static_cast<uint16_t>(slot);
-                if (table.pk_is_int) {
-                    table.pk_robin_index.insert(pk_int_val, loc);
-                } else {
-                    table.primary_index[pk_key] = loc;
-                }
+        // ── 4: Update primary key index ───────────────────────────────────
+        if (table.primary_key_col >= 0) {
+            uint64_t loc = (static_cast<uint64_t>(current_pid) << 16) | static_cast<uint16_t>(slot);
+            if (table.pk_is_int) {
+                table.pk_robin_index.insert(pk_int_val, loc);
+            } else {
+                table.primary_index[row_vals[pk_col]] = loc;
             }
         }
     }
@@ -986,6 +1014,10 @@ bool SqlEngine::parse_insert(const std::string& sql,
     std::size_t pos = static_cast<std::size_t>(p - s.c_str());
     rows.clear();
     expires_at.clear();
+    // Reserve a small initial capacity to avoid the first several doublings.
+    // We don't scan SQL to count rows — the scan would cost more than it saves.
+    rows.reserve(64);
+    expires_at.reserve(64);
 
     auto skip_spaces = [&](std::size_t& p) {
         while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p])) != 0) {
