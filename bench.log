@@ -1,0 +1,11 @@
+Connected to FlexQL
+Running SQL subset checks plus insertion benchmark...
+Target insert rows: 1000000
+
+[PASS] CREATE TABLE BIG_USERS (115 ms)
+
+Starting insertion benchmark for 1000000 rows...
+Progress: 114688/1000000
+Progress: 212992/1000000
+Progress: 311296/1000000
+[FAIL] INSERT BIG_USERS batch -> failed to read server response

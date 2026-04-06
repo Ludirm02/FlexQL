@@ -601,8 +601,15 @@ bool SqlEngine::execute_select(const std::string& sql,
         for (const std::string& ref : plan.select_columns) {
             std::string tbl, col; split_qualified(ref, tbl, col);
             std::size_t base_idx, right_idx; std::string err1, err2;
-            bool in_base = lookup_column(base, col.empty() ? ref : col, base_idx, err1) != nullptr;
-            bool in_right = right_ptr && lookup_column(*right_ptr, col.empty() ? ref : col, right_idx, err2) != nullptr;
+            bool in_base = false;
+            bool in_right = false;
+            
+            if (tbl.empty() || tbl == base.name) {
+                in_base = lookup_column(base, col.empty() ? ref : col, base_idx, err1) != nullptr;
+            }
+            if (right_ptr && (tbl.empty() || tbl == right_ptr->name)) {
+                in_right = lookup_column(*right_ptr, col.empty() ? ref : col, right_idx, err2) != nullptr;
+            }
             if (in_base && in_right) { error = "ambiguous column"; return false; }
             if (!in_base && !in_right) { error = "unknown column"; return false; }
             if (in_base) {
