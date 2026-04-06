@@ -1,6 +1,8 @@
+#include "../storage/wal.hpp"
 #include "../storage/table_iterator.hpp"
 #include <thread>
 #include "storage/disk_store.hpp"
+#include "storage/wal.hpp"
 #include "sql_engine.hpp"
 
 #pragma GCC optimize("O3,unroll-loops")
@@ -304,10 +306,14 @@ bool SqlEngine::execute(const std::string& sql,
     std::string upper = to_upper(normalized.substr(0, cmd_scan));
     if (starts_with_keyword(upper, kCreateTableKw)) {
         std::unique_lock<std::shared_mutex> lock(db_mutex_);
-        return execute_create_table(normalized, error);
+        bool ok = execute_create_table(normalized, error);
+        if (ok && !skip_disk_write_) WAL::instance().log(sql);
+        return ok;
     }
     if (starts_with_keyword(upper, kInsertIntoKw)) {
-        return execute_insert(normalized, error);
+        bool ok = execute_insert(normalized, error);
+        if (ok && !skip_disk_write_) WAL::instance().log(sql);
+        return ok;
     }
     if (starts_with_keyword(upper, kSelectKw)) {
         return execute_select(normalized, out, error, cached_wire_out, binary_wire);
@@ -318,7 +324,9 @@ bool SqlEngine::execute(const std::string& sql,
         std::string full_upper = to_upper(normalized);
         if (starts_with_keyword(full_upper, kDeleteFromKw)) {
             std::unique_lock<std::shared_mutex> lock(db_mutex_);
-            return execute_delete(normalized, error);
+            bool ok = execute_delete(normalized, error);
+            if (ok && !skip_disk_write_) WAL::instance().log(sql);
+            return ok;
         }
     }
 
@@ -552,6 +560,7 @@ bool SqlEngine::execute_select(const std::string& sql,
     const Table& base = base_it->second;
 
     bool skip_cache = false;
+    bool has_ttl = false;
     if (!plan.has_join && plan.where.present && plan.where.op == "=" && base.primary_key_col >= 0) {
         skip_cache = true;
     }
@@ -598,10 +607,10 @@ bool SqlEngine::execute_select(const std::string& sql,
             if (!in_base && !in_right) { error = "unknown column"; return false; }
             if (in_base) {
                 // Use qualified name in JOINs, plain name for single-table queries
-                const std::string out_name = plan.has_join ? (base.name + "." + ref) : (col.empty() ? ref : col);
+                const std::string out_name = plan.has_join ? (base.name + "." + (col.empty() ? ref : col)) : (col.empty() ? ref : col);
                 projections.push_back({&base, base_idx, out_name});
             } else {
-                projections.push_back({right_ptr, right_idx, right_ptr->name + "." + ref});
+                projections.push_back({right_ptr, right_idx, right_ptr->name + "." + (col.empty() ? ref : col)});
             }
         }
     }
@@ -628,6 +637,7 @@ bool SqlEngine::execute_select(const std::string& sql,
             }
             if (loc != RobinHoodIndex::kEmpty) {
                 PageRow pr = fetch_row_from_buf(base.buf_pool.get(), loc);
+                if (pr.expires_at > 0) has_ttl = true;
                 if (row_alive(pr, now_ts)) {
                     if (evaluate_where(base, pr, plan.where, &error)) {
                         emit_row(pr);
@@ -641,6 +651,7 @@ bool SqlEngine::execute_select(const std::string& sql,
             TableIterator iter(*base.buf_pool, base.disk_mgr->num_pages());
             while (iter.valid()) {
                 const PageRow& pr = iter.current();
+                if (pr.expires_at > 0) has_ttl = true;
                 if (row_alive(pr, now_ts)) {
                     bool pass = true;
                     if (plan.where.present) {
@@ -676,6 +687,7 @@ bool SqlEngine::execute_select(const std::string& sql,
             TableIterator hit(*hash_table->buf_pool, hash_table->disk_mgr->num_pages());
             while (hit.valid()) {
                 const PageRow& pr = hit.current();
+                if (pr.expires_at > 0) has_ttl = true;
                 if (row_alive(pr, now_ts)) {
                     join_hash_str[pr.values[hash_idx]].push_back(pr);
                 }
@@ -687,6 +699,7 @@ bool SqlEngine::execute_select(const std::string& sql,
             TableIterator pit(*probe_table->buf_pool, probe_table->disk_mgr->num_pages());
             while (pit.valid()) {
                 const PageRow& probe_row = pit.current();
+                if (probe_row.expires_at > 0) has_ttl = true;
                 if (!row_alive(probe_row, now_ts)) { pit.next(); continue; }
 
                 if (plan.join_op == "=") {
@@ -767,7 +780,7 @@ bool SqlEngine::execute_select(const std::string& sql,
             });
     }
 
-    if (!skip_cache) cache_.put(cache_key, out, versions, binary_wire);
+    if (!skip_cache && !has_ttl) cache_.put(cache_key, out, versions, binary_wire);
     return true;
 }
 bool SqlEngine::parse_create_table(const std::string& sql,
@@ -1784,7 +1797,7 @@ bool SqlEngine::compare_values(const std::string& lhs,
     if (type == DataType::kInt) {
         std::int64_t a = 0, b = 0;
         if (!fast_parse_int64(lhs, a) || !fast_parse_int64(rhs, b)) {
-            error = "invalid integer comparison value";
+            error = "invalid comparison value or unsupported AND logic";
             return false;
         }
         return apply_op(a, b);
@@ -1792,7 +1805,7 @@ bool SqlEngine::compare_values(const std::string& lhs,
     if (type == DataType::kDecimal) {
         double a = 0.0, b = 0.0;
         if (!fast_parse_double(lhs, a) || !fast_parse_double(rhs, b)) {
-            error = "invalid decimal comparison value";
+            error = "invalid comparison value or unsupported AND logic";
             return false;
         }
         return apply_op(a, b);

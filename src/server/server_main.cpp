@@ -415,8 +415,9 @@ int main(int argc, char** argv) {
         }
         // Flush recovered data to pages, then clear WAL permanently
         engine.checkpoint_to_disk();
+        // Truncate old WAL and open for active writing
         std::ofstream(wal_path, std::ios::trunc | std::ios::binary);
-        // Do NOT reopen WAL for writing — Buffer Pool now handles persistence
+        WAL::instance().open(wal_path);
     }
 
     std::cout << "FlexQL server listening on port " << port << "\n";

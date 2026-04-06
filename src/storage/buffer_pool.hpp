@@ -19,17 +19,12 @@ public:
     explicit BufferPoolManager(DiskManager& dm, std::size_t pool_size = 8192)
         : dm_(&dm), pool_size_(pool_size) {
         frames_.resize(pool_size_);
-        // Pre-fault frame page memory via memset so the OS allocates physical
-        // pages NOW (during CREATE TABLE) rather than lazily during INSERT.
-        // Simple assignment writes are dead-store-eliminated by -O3; memset
-        // is a library call with observable side-effects that the compiler
-        // cannot remove.  Cost: ~1 page fault per 4KB sub-page, ALL paid
-        // upfront so the INSERT hot path has zero page-fault interruptions.
         for (auto& f : frames_) {
             std::memset(f.page.data, 0, PAGE_SIZE);
         }
         for (std::size_t i = 0; i < pool_size_; ++i) free_list_.push_back(i);
     }
+
     Frame* pin(page_id_t pid) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = page_table_.find(pid);
@@ -47,6 +42,7 @@ public:
         lru_insert_front(fid);
         return &f;
     }
+
     Frame* new_page(page_id_t& pid_out) {
         std::lock_guard<std::mutex> lock(mutex_);
         std::size_t fid = get_frame();
@@ -58,6 +54,7 @@ public:
         lru_insert_front(fid);
         return &f;
     }
+
     void unpin(page_id_t pid, bool dirty) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = page_table_.find(pid);
@@ -66,9 +63,8 @@ public:
         if (f.pin_count > 0) f.pin_count--;
         if (dirty) f.dirty = true;
     }
-    // flush_all: write all dirty frames. If sync=true, fdatasync afterward.
+
     void flush_all(bool sync = false) {
-        // Collect dirty pages under lock, then write without holding lock
         std::vector<std::pair<page_id_t, Page>> dirty;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -84,16 +80,11 @@ public:
         }
         if (sync) dm_->fsync_data();
     }
+
     std::size_t pool_size() const { return pool_size_; }
 
-    // reset(): re-point this pool at a new DiskManager without freeing the
-    // underlying frames_ allocation.  This keeps the 96 MB of frame memory
-    // hot in the CPU cache and avoids the cold-page-fault tax that happens
-    // when a fresh vector is allocated for each CREATE TABLE call.
-    // Caller must have already called flush_all() and updated the disk file.
     void reset(DiskManager& new_dm) {
         std::lock_guard<std::mutex> lk(mutex_);
-        // Reset metadata of every frame that was in use — O(active_frames).
         for (auto& [pid, fid] : page_table_) {
             frames_[fid].page_id   = INVALID_PAGE_ID;
             frames_[fid].pin_count = 0;
@@ -104,8 +95,6 @@ public:
         lru_pos_.clear();
         free_list_.clear();
         for (std::size_t i = 0; i < pool_size_; ++i) free_list_.push_back(i);
-
-        // Re-point at the new disk manager (new empty db file).
         dm_ = &new_dm;
     }
 
@@ -120,7 +109,10 @@ private:
         for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
             std::size_t fid = *it;
             if (frames_[fid].pin_count == 0) {
-                if (frames_[fid].dirty) { dm_->write_page(frames_[fid].page_id, frames_[fid].page); frames_[fid].dirty = false; }
+                if (frames_[fid].dirty) {
+                    dm_->write_page(frames_[fid].page_id, frames_[fid].page);
+                    frames_[fid].dirty = false;
+                }
                 page_table_.erase(frames_[fid].page_id);
                 frames_[fid].page_id = INVALID_PAGE_ID;
                 lru_list_.erase(std::next(it).base());

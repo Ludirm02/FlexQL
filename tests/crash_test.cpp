@@ -27,8 +27,8 @@ int main() {
     
     // Query TEST_USERS (from unit tests)
     int rc = flexql_exec(db, "SELECT * FROM TEST_USERS;", print_cb, nullptr, &err);
-    if (rc != FLEXQL_OK) {
-        std::cout << "[FAIL] TEST_USERS not found after crash: " << (err ? err : "") << "\n";
+    if (rc != FLEXQL_OK || row_count == 0) {
+        std::cout << "[FAIL] TEST_USERS not found or empty after crash: " << (err ? err : "") << "\n";
         if (err) flexql_free(err);
     } else {
         std::cout << "[PASS] TEST_USERS survived crash with " << row_count << " rows\n";
@@ -37,8 +37,8 @@ int main() {
     // Query BIG_USERS count
     row_count = 0;
     rc = flexql_exec(db, "SELECT ID FROM BIG_USERS WHERE ID = 1;", print_cb, nullptr, &err);
-    if (rc != FLEXQL_OK) {
-        std::cout << "[FAIL] BIG_USERS not found after crash: " << (err ? err : "") << "\n";
+    if (rc != FLEXQL_OK || row_count == 0) {
+        std::cout << "[FAIL] BIG_USERS not found or empty after crash: " << (err ? err : "") << "\n";
         if (err) flexql_free(err);
     } else {
         std::cout << "[PASS] BIG_USERS survived crash, found " << row_count << " row(s) for ID=1\n";
