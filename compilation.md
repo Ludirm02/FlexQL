@@ -69,6 +69,12 @@ ls -lh data/wal/wal.log
 sleep 3
 
 # 6. Check data survival
-./bin/crash_test
 # Should output `[PASS] survived crash`!
+```
+
+## 6. Master Automated Testing Script
+If you wish to bypass all manual commands, a comprehensive automated bash script has been provided. It seamlessly executes a clean wipe, boots the daemon, tests the 21/21 AST structures, runs the 10-Million row throughput metric, and executes absolute Fault-Tolerance (kill-9 simulations) sequentially in one single command.
+
+```bash
+./scripts/run_all_tests.sh
 ```
