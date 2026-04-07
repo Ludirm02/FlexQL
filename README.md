@@ -1,27 +1,27 @@
-# ⚡ FlexQL - The High-Performance C++ Database Engine
+#  FlexQL - The High-Performance C++ Database Engine
 
 **Repository Link:** [https://github.com/Ludirm02/FlexQL](https://github.com/Ludirm02/FlexQL)
 
-FlexQL is a lightweight, enormously high-performance SQL-like database engine implemented entirely in C++17. Engineered to bypass Out-of-Memory (OOM) failures entirely by pushing data directly to a multithreaded disk Buffer Pool, it efficiently manages pure Out-Of-Core dataset dimensions (100 Million+ rows), boasting insertion speeds exceeding **~747,000 operations per second**.
+FlexQL is a lightweight SQL-like database engine implemented entirely in C++17. Engineered to avoid Out-of-Memory (OOM) failures by pushing data to a multithreaded disk Buffer Pool, it efficiently manages larger-than-RAM datasets (100 Million+ rows), achieving insertion speeds of **~807,000 operations per second**.
 
 It provides a multithreaded TCP server bounded by Readers-Writer locks, a standard C-compatible client API (`flexql.h`), and an interactive database terminal REPL.
 
 ---
 
-## 🚀 Core Technical Features
+##  Core Technical Features
 
-- **Standard SQL DDL/DML:** `CREATE TABLE` and `INSERT INTO ... VALUES (...)` with extreme-performance multi-row batch injection support.
+- **Standard SQL DDL/DML:** `CREATE TABLE` and `INSERT INTO ... VALUES (...)` with multi-row batch insert support.
 - **Data Primitives:** Fully supports `INT`, `DECIMAL`, `VARCHAR(n)`, `TEXT`, and structured `DATETIME` inputs.
 - **Automated Row Expiration:** Native parsing for `TTL <seconds>` or `EXPIRES <unix|datetime>`.
 - **Querying & Filtering:** Supports `SELECT *`, scoped `SELECT col1, col2`, and `INNER JOIN` logic between distinct tables.
 - **Relational Operators:** Fully supports single-condition `WHERE` filters with `=`, `!=`, `<`, `<=`, `>`, `>=` calculations.
-- **O(1) Primary Key Indexing:** Replaces slow binary trees with custom **Robin Hood open-addressing hash maps** for lightning-fast localized indexing.
-- **LRU Query Caching:** Smart LRU bounds with table-version temporal invalidation limits `SELECT` repetition drops.
+- **O(1) Primary Key Indexing:** Uses custom **Robin Hood open-addressing hash maps** for O(1) primary key lookups.
+- **LRU Query Caching:** Smart LRU bounds with table-version temporal invalidation limits `SELECT` repetition.
 - **Fault-Tolerant Persistence:** A background Write-Ahead Log (WAL) thread explicitly protects unflushed memory from total power-loss failures (`kill -9`).
 
 ---
 
-## 📂 Project Layout
+##  Project Layout
 
 ```text
 FlexQL/
@@ -40,7 +40,7 @@ FlexQL/
 
 ---
 
-## ⚙️ Build and Run Commands
+##  Build and Run Commands
 
 **Compile:** (Pure C++17, NO external libraries required)
 ```bash
@@ -58,9 +58,35 @@ mkdir -p data/wal data/pages data/tables
 ./bin/flexql-client 127.0.0.1 9000
 ```
 
-**Execute the heavy multi-million ingestion benchmarks:**
+**Execute 1-Million Row Benchmark:**
+```bash
+./bin/flexql_benchmark 1000000
+```
+
+**Execute the heavy 10-Million Row Benchmark:**
 ```bash
 ./bin/flexql_benchmark 10000000 
+```
+
+**Run Unit Tests Only:**
+```bash
+./bin/flexql_benchmark --unit-test
+```
+
+**Run Manual Crash Recovery Check:**
+*(Simulates a sudden power loss during a massive ingestion)*
+```bash
+# In terminal A:
+./bin/flexql_server 9000
+
+# In terminal B:
+./bin/flexql_benchmark 1000000 &
+sleep 1
+killall -9 flexql_server
+
+# In terminal A (restart server and verify data survival):
+./bin/flexql_server 9000
+./bin/flexql_smoke_test
 ```
 
 **Run the Master Auto-Validation Script (Validates tests + bounds + crashes):**
@@ -68,9 +94,17 @@ mkdir -p data/wal data/pages data/tables
 ./scripts/run_all_tests.sh
 ```
 
+**Troubleshooting: Reset Database (Wipe all data and WAL logs)**
+If you repeatedly run massive benchmarks without shutting down properly, the `wal.log` file will grow continuously. Use this to reset everything safely if the server crashes on boot:
+```bash
+pkill -9 -f flexql_server
+rm -rf data/wal/* data/pages/* data/tables/*
+./bin/flexql_server &
+```
+
 ---
 
-## 💻 Supported SQL Syntax
+##  Supported SQL Syntax
 
 ```sql
 -- Create table with varying structural primitive types
@@ -104,9 +138,9 @@ WHERE orders.amount > 10;
 
 ---
 
-## 🔌 Using the native C API 
+## Using the native C API 
 
-FlexQL operates strictly behind the `flexql.h` boundary struct implementations flawlessly, encapsulating logic correctly away from arbitrary pointers dynamically simulating generic execution pipelines implicitly.
+FlexQL provides a clean C API via the `flexql.h` header, encapsulating internal connection and execution logic safely.
 
 ```c
 #include "flexql.h"
@@ -153,9 +187,9 @@ int main() {
 
 ---
 
-## 📚 Deep-Dive Technical Documentation
-To truly understand the massive structural engineering constraints implemented cleanly to support `O(1)` query lookups natively whilst explicitly pushing execution past bounds of physically installed RAM constraints securely:
+##  Deep-Dive Technical Documentation
+To understand the internal architecture, including how it supports `O(1)` query lookups and dataset sizes exceeding physical RAM:
 
-1. 📖 **[The FlexQL Deep-Dive Design Document (design.md)](./design.md)** - Extensive, descriptive, and highly technical explanations covering the system's Buffer Pool memory allocation, Readers-Writer concurrency limits, Primary Key indexing limits securely and the crucial architecture tradeoffs powering 700k+ speeds.
-2. 📖 **[Compilation & Stress-Test Guide (compilation.md)](./compilation.md)** - Explicit copy-paste bash scripts mapping cleanly how to test the database via `Unit Tests`, massive heavy-load datasets, and cleanly executed power-loss simulated validations perfectly.
-3. 📖 **[Peak Performance Test Results (performance_results.md)](./performance_results.md)** - Raw data outputs directly logging explicit performance ceilings achieving safely bounded multi-million insertions efficiently.
+1.  **[The FlexQL Deep-Dive Design Document (designdoc.md)](./designdoc.md)** - Detailed explanations covering the system's Buffer Pool memory allocation, Readers-Writer concurrency, Primary Key indexing, and architecture tradeoffs.
+2.  **[Compilation & Stress-Test Guide (compilation.md)](./compilation.md)** - Instructions on how to test the database via unit tests, large datasets, and simulated power-loss validation.
+3.  **[Peak Performance Test Results (performance_results.md)](./performance_results.md)** - Raw data logs demonstrating performance benchmarks.

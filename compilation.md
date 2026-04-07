@@ -1,80 +1,98 @@
 # Compilation and Execution Instructions
 
-This document summarizes exactly how to build and execute FlexQL, ranging from basic unit tests to aggressive high-load 100-million row benchmarks and brutal crash recovery tests.
+This document summarizes exactly how to build, run, and test FlexQL.
 
-## 1. Compilation
-FlexQL uses a robust C++17 architecture requiring absolutely zero external libraries. To compile the entire system dynamically into your local `bin` folder, execute:
+## 1. Clean Compile & Setup
+FlexQL uses a robust C++17 architecture requiring absolutely zero external libraries. To compile the entire system dynamically into your local `bin` folder:
 ```bash
+cd ~/Desktop/FLEXQL
 make clean && make -j$(nproc)
-```
-
-## 2. Setting Up the Database
-Before running any tests, it is heavily recommended to start the server from a clean slate. This prepares the active physical `data/` structures.
-```bash
-# 1. Kill any existing instances of the server gracefully or forcefully:
-killall -9 flexql_server 2>/dev/null
-
-# 2. Build the directory layout and flush out the old data:
 mkdir -p data/wal data/pages data/tables
-rm -rf data/tables/* data/wal/* data/pages/*
-
-# 3. Boot the server continuously into the background stream:
-./bin/flexql_server > server.log 2>&1 & 
-
-# Give the server a few seconds to spin up port listeners on TCP 9000
-sleep 2
 ```
 
-## 3. Running Unit Tests
-Once the server is booted into the background, verify the AST String Parser and basic operations (e.g. `CREATE TABLE`, TTL Timestamps, `<`/`>` ops) by triggering the test script:
+## 2. Running the Database (Two-Terminal Workflow)
+FlexQL operates as a persistent daemon. You must run the server in one terminal and connect via the client in another.
+
+**Terminal 1 (The Server):**
+Start the database server. **You must keep this terminal open.**
+```bash
+./bin/flexql_server 9000
+```
+
+**Terminal 2 (The Interactive Client):**
+Open a new terminal window and connect to the server:
+```bash
+./bin/flexql-client 127.0.0.1 9000
+```
+*You can type standard SQL commands here ending with a semicolon (`;`), or `.exit` to quit.*
+
+## 3. Strict Final Submission Run Block (Verification)
+To absolutely guarantee the database meets all rubric requirements, run these sequential tests from your second terminal:
+
+**1. Run 21/21 Unit Tests (Validates SQL Logic & TTL Filters):**
 ```bash
 ./bin/flexql_benchmark --unit-test
 ```
-You should expect to see `Unit Test Summary: 21/21 passed, 0 failed.` output cleanly.
+*Expected Pass Condition:* `Unit Test Summary: 21/21 passed, 0 failed.`
 
-## 4. Running Benchmarks (Throughput Performance)
-FlexQL is massively fast. To test insertive ingestion over raw `.db` pages, trigger the row commands. Wait for the engine to spit out `Throughput: ... rows/sec`.
+**2. 1-Million Row Speed Benchmark:**
 ```bash
-# Light Benchmark
 ./bin/flexql_benchmark 1000000
-
-# Medium Load 
-./bin/flexql_benchmark 10000000
-
-# Stress Load (Proving Out-Of-Core Memory survives 6GB)
-./bin/flexql_benchmark 100000000
 ```
+*Expected Pass Condition:* Console reads `[PASS] INSERT benchmark complete` and logs ~800,000 throughput natively.
 
-
-## 5. Crash Recovery & Durability Testing
-To guarantee your un-flushed bits survive a complete machine hardware failure (via WAL asynchronous recovery logging), utilize this process block:
-
+**3. 10-Million Row Extreme Benchmark:**
 ```bash
-# 1. Recompile the crash test utility specifically
-g++ -std=c++17 -Wall -Wextra tests/crash_test.cpp src/client/flexql_client.cpp src/network/protocol.cpp -Iinclude -Isrc -Isrc/network -o bin/crash_test
+./bin/flexql_benchmark 10000000
+```
+*Expected Pass Condition:* Memory stays entirely stable through the disk Buffer Pool eviction cycle.
 
-# 2. Fire an intense heavy bulk insertion into the background thread pool
+**4. Crash / Recovery Test:**
+Proves the asynchronous Write-Ahead Log recovers un-flushed data during a power failure.
+```bash
+# In Terminal 1 (Server):
+./bin/flexql_server 9000
+
+# In Terminal 2 (Tests):
 ./bin/flexql_benchmark 1000000 &
-BENCH_PID=$!
-
-# 3. Brutally execute process failure mid-flight (simulated power-loss)
 sleep 1
 killall -9 flexql_server
 
-# 4. Prove the WAL buffered the mid-flight data! You will see massive file bytes here:
-ls -lh data/wal/wal.log
+# In Terminal 1 (Restart Server):
+./bin/flexql_server 9000
 
-# 5. Bring the Database server immediately back online to trigger WAL Replay Logic
-./bin/flexql_server > server_recovery.log 2>&1 &
-sleep 3
+# In Terminal 2 (Verify Recovery):
+./bin/flexql_smoke_test
+```
+*Expected Pass Condition:* `[PASS] survived crash` Output.
 
-# 6. Check data survival
-# Should output `[PASS] survived crash`!
+## 4. Troubleshooting & Connection Fixes
+
+### Issue: "Cannot open FlexQL" or "failed to connect"
+If the client cannot connect, the server is either not running, or the port is blocked. Run these checks:
+```bash
+# Check if the server process is actually alive:
+pgrep -af flexql_server
+
+# Check if port 9000 is correctly listening:
+ss -ltnp | grep 9000
+
+# View the last 80 lines of the server logs to spot errors:
+tail -n 80 /tmp/flexql_server.log
 ```
 
-## 6. Master Automated Testing Script
-If you wish to bypass all manual commands, a comprehensive automated bash script has been provided. It seamlessly executes a clean wipe, boots the daemon, tests the 21/21 AST structures, runs the 10-Million row throughput metric, and executes absolute Fault-Tolerance (kill-9 simulations) sequentially in one single command.
+### Issue: Server crashes instantly on boot ("Killed")
+**Root Cause:** If you repeatedly run massive performance benchmarks without a clean shutdown, your `data/wal/wal.log` file will grow exponentially (upwards of 7GB+). During startup, the server tries to load this massive file into RAM for replay recovery, causing the OS to OOM-kill it.
 
+**Fix:** Backup or wipe the massive WAL log file.
 ```bash
-./scripts/run_all_tests.sh
+# Stop any broken servers trying to load
+pkill -9 flexql_server 2>/dev/null || true
+
+# Backup the massive WAL file so it doesn't try to load again
+mv data/wal/wal.log data/wal/wal.log.bak.$(date +%s)
+# (Or strictly run `rm -rf data/wal/* data/pages/* data/tables/*` if you want a clean database)
+
+# Start server fresh
+./bin/flexql_server 9000
 ```
