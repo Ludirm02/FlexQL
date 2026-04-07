@@ -9,3 +9,6 @@ data/tables/*.schema
 data/wal/wal.log
 data/pages/*.db
 data/
+
+.venv_pdfcheck/
+.venv/
